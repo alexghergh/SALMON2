@@ -83,18 +83,7 @@ subroutine zstencil_typical_gpu(io_s,io_e,Nspin,is_array,ie_array,is,ie,idx,idy,
     htpsi(ix,iy,iz,ispin,io) = V_local(ispin)%f(ix,iy,iz)*tpsi(ix,iy,iz,ispin,io) &
                     + lap0*tpsi(ix,iy,iz,ispin,io) &
                     - 0.5d0 * v - zI * w
-  end do
-  end do
-  end do
-  end do
-  end do
-
-!$acc loop collapse(5)
-  do io=io_s,io_e
-  do ispin=1,Nspin
-  do iz=igs(3),ige(3)
-  do iy=igs(2),ige(2)
-  do ix=igs(1),ige(1)
+    ! Keep the X assignment and the Y/Z subtraction in their original order.
     v = z0
     w = z0
 #endif
