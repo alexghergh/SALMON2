@@ -33,9 +33,9 @@ contains
     ! if(flag_nlcc)rho_s = rho_s + 0.5d0*rho_nlcc
     
 #ifdef USE_OPENACC
-!$acc kernels loop private(i,trho,e_xc,de_xc_drho)
+!$acc kernels loop private(i,trho,e_xc,de_xc_drho,de_xc_drhob)
 #else
-!$omp parallel do private(i,trho,e_xc,de_xc_drho)
+!$omp parallel do private(i,trho,e_xc,de_xc_drho,de_xc_drhob)
 #endif
     do i=1,NL
       trho=rho_s(i)
