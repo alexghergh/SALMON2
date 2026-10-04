@@ -1355,8 +1355,16 @@ contains
       real(8) :: vexc_1d(nl)
       real(8) :: vexc_sp_1d(nl,2)
 
+#ifdef USE_OPENACC
+!$acc data create(rho_s_1d, exc_1d, eexc_1d, vexc_1d) if(xc%ispin == 0)
+#endif
+
       if (xc%ispin == 0) then
+#ifdef USE_OPENACC
+        call exec_builtin_calc_ax(rho_s_1d, 0.5d0, rho, nl)
+#else
         rho_s_1d = reshape(rho, (/nl/)) * 0.5
+#endif
       else if (xc%ispin == 1) then
         rho_s_sp_1d = reshape(rho_s, (/nl,2/))
       end if
@@ -1364,7 +1372,11 @@ contains
 #ifndef SALMON_DEBUG_NEGLECT_NLCC
       if (present(rho_nlcc)) then
         if ( xc%ispin == 0 ) then
+#ifdef USE_OPENACC
+          call exec_builtin_calc_axpy(rho_s_1d, 0.5d0, rho_nlcc, nl)
+#else
           rho_s_1d = rho_s_1d + reshape(rho_nlcc, (/nl/)) * 0.5
+#endif
         else if ( xc%ispin == 1 ) then
           rho_s_sp_1d(:,1) = rho_s_sp_1d(:,1) + reshape(rho_nlcc, (/nl/)) * 0.5
           rho_s_sp_1d(:,2) = rho_s_sp_1d(:,2) + reshape(rho_nlcc, (/nl/)) * 0.5
@@ -1380,7 +1392,11 @@ contains
 
       if (xc%ispin == 0) then
         if (present(vxc)) then
+#ifdef USE_OPENACC
+          call exec_builtin_calc_axpy(vxc, 1.0d0, vexc_1d, nl)
+#else
            vxc = vxc + reshape(vexc_1d, (/nx, ny, nz/))
+#endif
         endif
       else if(xc%ispin == 1) then
         if (present(vxc_s)) then
@@ -1389,13 +1405,24 @@ contains
       end if
 
       if (present(exc)) then
+#ifdef USE_OPENACC
+        call exec_builtin_calc_axpy(exc, 1.0d0, exc_1d, nl)
+#else
          exc = exc + reshape(exc_1d, (/nx, ny, nz/))
+#endif
       endif
 
       if (present(eexc)) then
+#ifdef USE_OPENACC
+        call exec_builtin_calc_axpy(eexc, 1.0d0, eexc_1d, nl)
+#else
          eexc = eexc + reshape(eexc_1d, (/nx, ny, nz/))
+#endif
       endif
 
+#ifdef USE_OPENACC
+!$acc end data
+#endif
       return
     end subroutine exec_builtin_pw
     
