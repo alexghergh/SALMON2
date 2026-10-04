@@ -766,7 +766,10 @@ do ispin = 1, system%nspin
      stop "ScaLAPACK does not enabled, please check your build configuration."
 #endif
   else
-     call eigen_dsyev(hmat, eval, evec)
+     ! The preceding reductions replicate hmat over the r-space/orbital group.
+     if (info%id_ro == 0) call eigen_dsyev(hmat, eval, evec)
+     call comm_bcast(eval, info%icomm_ro, 0)
+     call comm_bcast(evec, info%icomm_ro, 0)
   endif
 
 !  evec = real(zevec)
