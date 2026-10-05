@@ -35,7 +35,7 @@ else ()
           cusolver_wrapper.f90
           )
     if(USE_ORDERED_SMALL_GRAM)
-        list(APPEND SOURCES small_gram_ordered_cuda.f90)
+        list(APPEND SOURCES small_gram_ordered_cuda.f90 small_gram_ordered_batch4_cuda.f90)
     endif()
     if(USE_CUDA)
         set(SOURCES ${SOURCES}

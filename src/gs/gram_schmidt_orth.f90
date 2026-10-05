@@ -284,6 +284,18 @@ contains
     complex(8) :: umat(wfi%numo_max,wfi%numo), umat_tmp(wfi%numo_max,wfi%numo)
     complex(8) :: ZDOTC
 
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+    ! Independent local k blocks; preserve the original path outside this bound.
+    ! The extra packed workspace is at most 301056*16*4 complex(8) = 294 MiB.
+    if (wfi%numo == 16 .and. sys%nspin == 1 .and. &
+        .not.wfi%if_divide_rspace .and. .not.wfi%if_divide_orbit .and. &
+        wfi%nporbital == 1 .and. wfi%id_o == 0 .and. wfi%io_e-wfi%io_s+1 == 16 .and. &
+        all(rg%ie >= rg%is) .and. product(int(rg%ie-rg%is+1,kind=8)) <= 301056_8) then
+      call gram_schmidt_col_cblas_batch4(sys, rg, wfi, wf)
+      return
+    endif
+#endif
+
 #if defined(USE_OPENACC) && defined(USE_CUDA_CUBLASV2)
     istat = cublasCreate(handle)
     istat = cudaStreamCreate(custream)
@@ -702,6 +714,58 @@ contains
     return
 
   end subroutine gram_schmidt_col_cblas
+
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+  ! Pack independent k blocks once, retaining the original per-block arithmetic.
+  subroutine gram_schmidt_col_cblas_batch4(sys, rg, wfi, wf)
+    use structures, only: s_dft_system, s_rgrid, s_parallel_info, s_orbital
+    use pack_unpack, only: copy_data
+    use small_gram_ordered_batch4_cuda, only: small_gram_ordered_batch4
+    implicit none
+    type(s_dft_system), intent(in) :: sys
+    type(s_rgrid), intent(in) :: rg
+    type(s_parallel_info), intent(in) :: wfi
+    type(s_orbital), intent(inout) :: wf
+    complex(8), allocatable :: wf_batch(:,:,:,:,:)
+    integer :: nsize_rg, im, ik0, ik, ib, nb, io, jo, small_status, allocation_status
+
+    nsize_rg = product(rg%ie-rg%is+1)
+    allocate(wf_batch(rg%is(1):rg%ie(1), rg%is(2):rg%ie(2), rg%is(3):rg%ie(3), 16, 4), &
+             stat=allocation_status)
+    if (allocation_status /= 0) error stop 'small Gram batch workspace allocation failure'
+!$acc data create(wf_batch)
+    do im = wfi%im_s, wfi%im_e
+      do ik0 = wfi%ik_s, wfi%ik_e, 4
+        nb = min(4, wfi%ik_e-ik0+1)
+        do ib = 1, nb
+          ik = ik0+ib-1
+          do io = wfi%io_s, wfi%io_e
+            jo = io-wfi%io_s+1
+            call copy_data( &
+              wf%zwf(rg%is(1):rg%ie(1), rg%is(2):rg%ie(2), rg%is(3):rg%ie(3), 1, io, ik, im), &
+              wf_batch(:,:,:,jo,ib))
+          enddo
+        enddo
+!$acc host_data use_device(wf_batch)
+        small_status = small_gram_ordered_batch4(nsize_rg, 16, nb, sys%hvol, &
+          wf_batch(rg%is(1),rg%is(2),rg%is(3),1,1))
+!$acc end host_data
+        if (small_status /= 0) error stop 'small Gram batch ordered CUDA failure'
+        do ib = 1, nb
+          ik = ik0+ib-1
+          do io = wfi%io_s, wfi%io_e
+            jo = io-wfi%io_s+1
+            call copy_data( &
+              wf_batch(:,:,:,jo,ib), &
+              wf%zwf(rg%is(1):rg%ie(1), rg%is(2):rg%ie(2), rg%is(3):rg%ie(3), 1, io, ik, im))
+          enddo
+        enddo
+      enddo
+    enddo
+!$acc end data
+    deallocate(wf_batch)
+  end subroutine gram_schmidt_col_cblas_batch4
+#endif
 
   !=======================================================================
 
