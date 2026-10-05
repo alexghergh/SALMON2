@@ -211,21 +211,28 @@ contains
     type(s_orbital),intent(in) :: hx,g
     complex(8),intent(in) :: norm(:,:,:)
     if(s%mode==1)then
-      call exact('Hx',reshape(s%hx,[size(s%hx)]),reshape(hx%zwf,[size(hx%zwf)]))
-      call exact('gradient',reshape(s%g,[size(s%g)]),reshape(g%zwf,[size(g%zwf)]))
+      call exact('Hx',reshape(s%hx,[size(s%hx)]),reshape(hx%zwf,[size(hx%zwf)]),.false.)
+      call exact('gradient',reshape(s%g,[size(s%g)]),reshape(g%zwf,[size(g%zwf)]),.false.)
       call exact('norm',reshape(s%norm,[size(s%norm)]),reshape(norm,[size(norm)]))
       deallocate(s%hx,s%g)
     endif
     if(allocated(s%norm))deallocate(s%norm)
   end subroutine
 
-  subroutine exact(label,a,b)
+  subroutine exact(label,a,b,check_finite)
     character(*),intent(in) :: label
     complex(8),intent(in) :: a(:),b(:)
+    logical,intent(in),optional :: check_finite
+    logical :: finite_required
+    ! Padding may hold any value, NaN included: compare it bit by bit, but do not require it finite.
+    finite_required=.true.
+    if(present(check_finite))finite_required=check_finite
     if(size(a)/=size(b))error stop 'CG shadow shape mismatch'
+    if(finite_required)then
     if(.not.all(ieee_is_finite(real(a))).or..not.all(ieee_is_finite(aimag(a))).or. &
        .not.all(ieee_is_finite(real(b))).or..not.all(ieee_is_finite(aimag(b)))) &
       error stop 'CG shadow nonfinite'
+    endif
     if(any(transfer(a,[0_c_int64_t])/=transfer(b,[0_c_int64_t])))then
       write(*,*) 'CG_CUDA SHADOW_MISMATCH ',label
       error stop 'CG shadow bitwise mismatch; no promotion'
