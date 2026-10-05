@@ -238,6 +238,9 @@ contains
     ! Only for the colinear L(S)DA:
     use structures, only: s_dft_system, s_rgrid, s_parallel_info, s_orbital
     use pack_unpack, only: copy_data
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+    use small_gram_ordered_cuda, only: small_gram_ordered
+#endif
     use timer
     use communication, only: comm_bcast, comm_summation
 #if defined(USE_OPENACC) && defined(USE_CUDA_CUBLASV2)
@@ -265,6 +268,10 @@ contains
 #endif
 
     integer :: nsize_rg
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+    integer :: small_status
+    logical :: gpu_small
+#endif
     integer :: ik, im, ispin, m
     integer :: io, jo, jo1, jo2
     integer :: idiv1, idiv2, idiv3, io0_s, io0_e, io1_s, io1_e, io2_s, io2_e, io3_s, io3_e
@@ -285,6 +292,10 @@ contains
 
     nsize_rg = (rg%ie(1)-rg%is(1)+1)*(rg%ie(2)-rg%is(2)+1)*(rg%ie(3)-rg%is(3)+1)
 
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+    gpu_small = wfi%numo == 16 .and. .not.wfi%if_divide_rspace .and. .not.wfi%if_divide_orbit
+!$acc data if(gpu_small) create(wf_block)
+#endif
     do im = wfi%im_s, wfi%im_e
     do ik = wfi%ik_s, wfi%ik_e
     do ispin = 1, sys%nspin
@@ -297,6 +308,15 @@ contains
           & wf_block(:, :, :, jo))
       end do
 
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+      if (gpu_small) then
+!$acc host_data use_device(wf_block)
+        small_status = small_gram_ordered(nsize_rg, wfi%numo, sys%hvol, &
+          wf_block(rg%is(1),rg%is(2),rg%is(3),1))
+!$acc end host_data
+        if (small_status /= 0) error stop 'small Gram ordered CUDA failure'
+      else
+#endif
       ! Loop for all:
       do m = 0, wfi%nporbital-1
         if(wfi%id_o==m)then
@@ -657,6 +677,9 @@ contains
         end if ! wfi%if_divide_orbit
 
       end do !m
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+      endif
+#endif
 
       do io = wfi%io_s, wfi%io_e
         jo = io - wfi%io_s + 1
@@ -668,6 +691,9 @@ contains
     end do !ispin
     end do !ik
     end do !im
+#if defined(USE_OPENACC) && defined(USE_ORDERED_SMALL_GRAM)
+!$acc end data
+#endif
 
 #if defined(USE_OPENACC) && defined(USE_CUDA_CUBLASV2)
     istat = cudaStreamDestroy(custream)

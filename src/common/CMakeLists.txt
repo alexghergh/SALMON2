@@ -34,6 +34,9 @@ else ()
           cublas_wrapper.f90
           cusolver_wrapper.f90
           )
+    if(USE_ORDERED_SMALL_GRAM)
+        list(APPEND SOURCES small_gram_ordered_cuda.f90)
+    endif()
     if(USE_CUDA)
         set(SOURCES ${SOURCES}
             zpseudo.cu

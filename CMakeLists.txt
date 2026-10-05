@@ -46,6 +46,15 @@ option_set(USE_EIGENEXA  "Use EigenExa Library"    OFF)
 option_set(USE_LIBXC     "Use Libxc library"       OFF)
 option_set(USE_FFTW      "Use FFTW library"        OFF)
 
+# The CUDA Fortran kernels follow the operation order of ZDOTC/ZDSCAL/ZAXPY in the BLAS bundled
+# with NVHPC (OpenBLAS kernels for AMD Zen), which the OpenACC build otherwise calls on the CPU.
+option(USE_ORDERED_SMALL_GRAM "Run Gram-Schmidt for 16 undivided complex orbitals with CUDA Fortran (OpenACC builds)" OFF)
+if(USE_ORDERED_SMALL_GRAM)
+  if(NOT USE_OPENACC OR NOT CMAKE_Fortran_COMPILER_ID STREQUAL "NVHPC")
+    message(FATAL_ERROR "USE_ORDERED_SMALL_GRAM requires NVHPC Fortran and USE_OPENACC")
+  endif()
+endif()
+
 ## Optimization for stencil compitations
 option_set(USE_OPT_ARRAY_PADDING           "Enable array padding for the stencil"          ON)
 option_set(USE_OPT_EXPLICIT_VECTORIZATION  "Enable explicit vectorization for the stencil" OFF)
