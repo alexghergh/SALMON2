@@ -24,11 +24,30 @@ project(SALMON
         LANGUAGES Fortran C
         )
 
+# Optional CUDA kernels for parts of the ground-state solver in CPU (non-OpenACC) builds.
+# They keep the operation order of the CPU code they replace. All are OFF by default.
+option(SALMON_CG_CUDA "Offload the complex CG solver gscg_zwf to CUDA in CPU builds (see SALMON_CG_CUDA_MODE)" OFF)
+set(SALMON_CG_CUDA_ARCH "" CACHE STRING "Explicit allocated CUDA architecture, e.g. 90")
+if(SALMON_CG_CUDA)
+  if(CMAKE_VERSION VERSION_LESS 3.18)
+    message(FATAL_ERROR "SALMON_CG_CUDA requires CMake >= 3.18")
+  endif()
+  if(SALMON_CG_CUDA_ARCH STREQUAL "")
+    message(FATAL_ERROR "Set SALMON_CG_CUDA_ARCH explicitly")
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+endif()
+
 message(STATUS "user-defined FFLAGS  = ${CMAKE_Fortran_FLAGS}")
 message(STATUS "user-defined CFLAGS  = ${CMAKE_C_FLAGS}")
 message(STATUS "user-defined LDFLAGS = ${CMAKE_EXE_LINKER_FLAGS}")
 
 include(cmakefiles/check_build_environments.cmake)
+
+if(SALMON_CG_CUDA AND USE_OPENACC)
+  message(FATAL_ERROR "SALMON_CG_CUDA works only in CPU builds; do not combine it with an OpenACC platform file")
+endif()
 
 if(USE_OPENACC)
   if(USE_CUDA)

@@ -367,6 +367,10 @@ end subroutine gscg_rwf
 
 subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   use structures
+#ifdef SALMON_CG_CUDA
+  use cg_resident_bridge, only: cg_region_state,cg_region_begin,cg_region_products_check, &
+       cg_region_finish,cg_region_update_check,cg_region_report
+#endif
   use timer
   use hamiltonian, only: hpsi
   use communication, only: comm_summation
@@ -395,6 +399,9 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   complex(8),allocatable :: utmp3(:,:,:,:),wtmp2(:,:,:,:),zb(:,:,:)
   complex(8) :: utmp2(2,2),btmp2(2,2)
   complex(8) :: work(9),zphase,ztmp
+#ifdef SALMON_CG_CUDA
+  type(cg_region_state) :: cuda_region
+#endif
 
   if(info%im_s/=1 .or. info%im_e/=1) stop "error: im/=1 @ gscg"
 
@@ -551,12 +558,20 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
 
     call timer_begin(LOG_GSCG_PERIODIC_CALC)
 
+#ifdef SALMON_CG_CUDA
+    call cg_region_begin(cuda_region,mg,system,info,xk,cg%pk,hxk,cg%hpk,gk,yn_spinorbit,wtmp2)
+    if(cuda_region%mode/=2)then
+#endif
     call inner_product(mg,system,info,xk,   xk,    wtmp2(1,:,:,:))
     call inner_product(mg,system,info,cg%pk,xk,    wtmp2(2,:,:,:))
     call inner_product(mg,system,info,cg%pk,cg%pk, wtmp2(3,:,:,:))
     call inner_product(mg,system,info,xk,   hxk,   wtmp2(4,:,:,:))
     call inner_product(mg,system,info,cg%pk,hxk,   wtmp2(5,:,:,:))
     call inner_product(mg,system,info,cg%pk,cg%hpk,wtmp2(6,:,:,:))
+#ifdef SALMON_CG_CUDA
+    endif
+    call cg_region_products_check(cuda_region,wtmp2)
+#endif
 
     do ik=ik_s,ik_e
     do io=io_s,io_e
@@ -598,6 +613,10 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
     end do ! io
     end do ! ik
     
+#ifdef SALMON_CG_CUDA
+    call cg_region_finish(cuda_region,system,info,utmp3,E,hxk,gk,zb)
+    if(cuda_region%mode/=2)then
+#endif
 #ifdef USE_OPENACC
 !$acc parallel loop private(ik,io,ispin,iz,iy) collapse(5)
 #else
@@ -621,6 +640,10 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
     end do
     
     call inner_product(mg,system,info,gk,gk,zb)
+#ifdef SALMON_CG_CUDA
+    endif
+    call cg_region_update_check(cuda_region,hxk,gk,zb)
+#endif
     rb = dble(zb)
     
     bk = -1d0
@@ -661,6 +684,9 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   deallocate( utmp3,wtmp2 )
   deallocate( bk,gkgk,E1,E,rb,res )
   deallocate( zb )
+#ifdef SALMON_CG_CUDA
+  call cg_region_report(info%id_rko)
+#endif
 
   call timer_end(LOG_GSCG_PERIODIC_CALC)
 

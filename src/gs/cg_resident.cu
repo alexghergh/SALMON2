@@ -1,0 +1,167 @@
+// CUDA kernels and device context for the complex CG solver gscg_zwf (SALMON_CG_CUDA).
+// The 2x2 ZHEGV of each orbital and the step decisions stay on the CPU.
+#include <cuda_runtime.h>
+#include <cstddef>
+#include <limits>
+#include <new>
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
+struct Grid {
+    int nx,ny,nz,halo,nv;
+    size_t sx,sy,plane,field;
+    __device__ size_t at(int ix,int iy,int iz,int v) const {
+        return size_t(v)*field+size_t(iz+halo)*plane+size_t(iy+halo)*sx+ix+halo;
+    }
+};
+__device__ __forceinline__ double2 sum(double2 a,double2 b){
+    return make_double2(__dadd_rn(a.x,b.x),__dadd_rn(a.y,b.y));
+}
+// Same arithmetic as the CPU loops of gscg_zwf compiled by nvfortran 26.1: complex products
+// use FMA, and grid points are summed one at a time in loop order.
+__device__ __forceinline__ double2 conjugate_product(double2 a,double2 b){
+    return make_double2(__fma_rn(a.x,b.x,__dmul_rn(a.y,b.y)),
+                        __fma_rn(a.x,b.y,__dmul_rn(-a.y,b.x)));
+}
+__device__ __forceinline__ double2 multiply(double2 c,double2 a){
+    return make_double2(__fma_rn(c.x,a.x,__dmul_rn(-c.y,a.y)),
+                        __fma_rn(c.x,a.y,__dmul_rn(c.y,a.x)));
+}
+__device__ __forceinline__ double2 updated_gradient(double2 x,double2 p,double2 &hx,
+        double2 hp,double2 u1,double2 u2,double e){
+    hx=sum(multiply(u1,hx),multiply(u2,hp));
+    const double2 proposed=sum(multiply(u1,x),multiply(u2,p));
+    return make_double2(__fma_rn(e,proposed.x,-hx.x),__fma_rn(e,proposed.y,-hx.y));
+}
+__global__ void fill_guard(double2 *g,size_t n){
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<n)g[i]=make_double2(0.75e20,-0.125e20);
+}
+__global__ void six_ordered(Grid q,const double2 *x,const double2 *p,const double2 *hx,
+                            const double2 *hp,double h,double2 *out){
+    int v=blockIdx.x*blockDim.x+threadIdx.x;
+    if(v>=q.nv)return;
+    double2 a[6]={};
+    for(int iz=0;iz<q.nz;++iz)for(int iy=0;iy<q.ny;++iy)for(int ix=0;ix<q.nx;++ix){
+        size_t i=q.at(ix,iy,iz,v);
+        double2 xx=x[i],pp=p[i],hhx=hx[i],hhp=hp[i];
+        a[0]=sum(a[0],conjugate_product(xx,xx));
+        a[1]=sum(a[1],conjugate_product(pp,xx));
+        a[2]=sum(a[2],conjugate_product(pp,pp));
+        a[3]=sum(a[3],conjugate_product(xx,hhx));
+        a[4]=sum(a[4],conjugate_product(pp,hhx));
+        a[5]=sum(a[5],conjugate_product(pp,hhp));
+    }
+    for(int k=0;k<6;++k)out[6*v+k]=make_double2(__dmul_rn(a[k].x,h),__dmul_rn(a[k].y,h));
+}
+__global__ void gradient_points(Grid q,const double2 *x,const double2 *p,double2 *hx,
+        const double2 *hp,const double2 *u,const double *e,double2 *g){
+    size_t id=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    const size_t physical=size_t(q.nx)*q.ny*q.nz;
+    if(id>=physical*q.nv)return;
+    int v=id/physical;size_t j=id%physical;
+    int ix=j%q.nx,iy=(j/q.nx)%q.ny,iz=j/(size_t(q.nx)*q.ny);
+    size_t i=q.at(ix,iy,iz,v);
+    double2 hhx=hx[i];
+    g[i]=updated_gradient(x[i],p[i],hhx,hp[i],u[2*v],u[2*v+1],e[v]);
+    hx[i]=hhx;
+}
+template<bool Fused>
+__global__ void gradient_norm(Grid q,const double2 *x,const double2 *p,double2 *hx,
+        const double2 *hp,const double2 *u,const double *e,double2 *g,double h,double2 *out){
+    int v=blockIdx.x*blockDim.x+threadIdx.x;
+    if(v>=q.nv)return;
+    double2 a=make_double2(0.,0.);
+    for(int iz=0;iz<q.nz;++iz)for(int iy=0;iy<q.ny;++iy)for(int ix=0;ix<q.nx;++ix){
+        size_t i=q.at(ix,iy,iz,v);
+        double2 gg;
+        if constexpr(Fused){
+            double2 hhx=hx[i];
+            gg=updated_gradient(x[i],p[i],hhx,hp[i],u[2*v],u[2*v+1],e[v]);
+            hx[i]=hhx;g[i]=gg;
+        } else gg=g[i];
+        a=sum(a,conjugate_product(gg,gg));
+    }
+    out[v]=make_double2(__dmul_rn(a.x,h),__dmul_rn(a.y,h));
+}
+
+
+struct Context {
+    Grid q;
+    size_t bytes,physical;
+    double h;
+    double2 *x=nullptr,*p=nullptr,*hx=nullptr,*hp=nullptr,*g=nullptr;
+    double2 *u=nullptr,*six=nullptr,*norm=nullptr;
+    double *e=nullptr;
+};
+extern "C" int salmon_cg_device_guard(){
+    const char *visible=std::getenv("CUDA_VISIBLE_DEVICES");
+    if(!visible||!*visible||std::strchr(visible,','))return -10;
+    int count=0; auto rc=cudaGetDeviceCount(&count);
+    if(rc!=cudaSuccess)return int(rc);
+    return count==1?0:-11;
+}
+extern "C" int salmon_cg_close(void *handle){
+    auto *c=static_cast<Context*>(handle);if(!c)return 0;
+    int result=0;
+    auto release=[&](void *p){if(p){int rc=int(cudaFree(p));if(!result)result=rc;}};
+    release(c->x);release(c->p);release(c->hx);release(c->hp);release(c->g);
+    release(c->u);release(c->six);release(c->norm);release(c->e);
+    delete c;return result;
+}
+extern "C" int salmon_cg_begin(int nx,int ny,int nz,int nv,int pady,double h,
+ const double2 *x,const double2 *p,const double2 *hx,const double2 *hp,
+ double2 *six,void **handle){
+    if(!handle)return -1;*handle=nullptr;
+    if(pady<0||pady>1||nx<=0||ny<=0||nz<=0||nv<=0||nv>std::numeric_limits<int>::max()-127||!x||!p||!hx||!hp||!six)return -1;
+    int rc=salmon_cg_device_guard();if(rc)return rc;
+    size_t cells=nx;
+    for(size_t n:{size_t(ny)+pady,size_t(nz),size_t(nv)}){
+        if(cells>std::numeric_limits<size_t>::max()/n)return -2;cells*=n;
+    }
+    if(cells>std::numeric_limits<size_t>::max()/sizeof(double2)||
+       cells>size_t(std::numeric_limits<int>::max())*128)return -2;
+    auto *c=new(std::nothrow) Context;if(!c)return -3;
+    c->q=Grid{nx,ny,nz,0,nv,size_t(nx),size_t(ny)+pady,
+              size_t(nx)*(size_t(ny)+pady),size_t(nx)*(size_t(ny)+pady)*nz};
+    c->bytes=cells*sizeof(double2);c->physical=size_t(nx)*ny*nz*nv;c->h=h;
+#define TRY(cmd) do{rc=int(cmd);if(rc){salmon_cg_close(c);return rc;}}while(0)
+    for(double2 **a:{&c->x,&c->p,&c->hx,&c->hp,&c->g})TRY(cudaMalloc(reinterpret_cast<void**>(a),c->bytes));
+    TRY(cudaMalloc(reinterpret_cast<void**>(&c->u),size_t(nv)*2*sizeof(double2)));
+    TRY(cudaMalloc(reinterpret_cast<void**>(&c->six),size_t(nv)*6*sizeof(double2)));
+    TRY(cudaMalloc(reinterpret_cast<void**>(&c->norm),size_t(nv)*sizeof(double2)));
+    TRY(cudaMalloc(reinterpret_cast<void**>(&c->e),size_t(nv)*sizeof(double)));
+    TRY(cudaMemcpy(c->x,x,c->bytes,cudaMemcpyHostToDevice));
+    TRY(cudaMemcpy(c->p,p,c->bytes,cudaMemcpyHostToDevice));
+    TRY(cudaMemcpy(c->hx,hx,c->bytes,cudaMemcpyHostToDevice));
+    TRY(cudaMemcpy(c->hp,hp,c->bytes,cudaMemcpyHostToDevice));
+    six_ordered<<<(size_t(nv)+127)/128,128>>>(c->q,c->x,c->p,c->hx,c->hp,h,c->six);
+    TRY(cudaGetLastError());
+    TRY(cudaMemcpy(six,c->six,size_t(nv)*6*sizeof(double2),cudaMemcpyDeviceToHost));
+    *handle=c;return 0;
+#undef TRY
+}
+extern "C" int salmon_cg_finish(void *handle,const double2 *u,const double *e,
+ double2 *hx,double2 *g,double2 *norm,int fused){
+    auto *c=static_cast<Context*>(handle);
+    if(!c||!u||!e||!hx||!g||!norm||(fused!=0&&fused!=1))return -1;
+    int rc;
+#define TRY(cmd) do{rc=int(cmd);if(rc)return rc;}while(0)
+    const size_t nv=c->q.nv;
+    TRY(cudaMemcpy(c->u,u,2*nv*sizeof(double2),cudaMemcpyHostToDevice));
+    TRY(cudaMemcpy(c->e,e,nv*sizeof(double),cudaMemcpyHostToDevice));
+    if(fused)gradient_norm<true><<<(nv+127)/128,128>>>(c->q,c->x,c->p,c->hx,c->hp,c->u,c->e,c->g,c->h,c->norm);
+    else {
+        gradient_points<<<(c->physical+127)/128,128>>>(c->q,c->x,c->p,c->hx,c->hp,c->u,c->e,c->g);
+        TRY(cudaGetLastError());
+        gradient_norm<false><<<(nv+127)/128,128>>>(c->q,c->x,c->p,c->hx,c->hp,c->u,c->e,c->g,c->h,c->norm);
+    }
+    TRY(cudaGetLastError());
+    TRY(cudaMemcpy(hx,c->hx,c->bytes,cudaMemcpyDeviceToHost));
+    // Copy only physical rows; leave caller gradient padding byte-for-byte untouched.
+    TRY(cudaMemcpy2D(g,c->q.plane*sizeof(double2),c->g,c->q.plane*sizeof(double2),
+                     size_t(c->q.nx)*c->q.ny*sizeof(double2),size_t(c->q.nz)*nv,cudaMemcpyDeviceToHost));
+    TRY(cudaMemcpy(norm,c->norm,nv*sizeof(double2),cudaMemcpyDeviceToHost));
+    return 0;
+#undef TRY
+}

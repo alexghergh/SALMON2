@@ -36,5 +36,17 @@ if(USE_ORDERED_SMALL_GRAM)
   target_link_options(${TARGET_NAME} PRIVATE -cuda)
 endif()
 
+if(SALMON_CG_CUDA)
+  add_library(salmon_cg_cuda STATIC gs/cg_resident.cu)
+  set_target_properties(salmon_cg_cuda PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${SALMON_CG_CUDA_ARCH}"
+    CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
+  target_compile_options(salmon_cg_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+  set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/gs/conjugate_gradient.f90
+               APPEND PROPERTY COMPILE_DEFINITIONS SALMON_CG_CUDA)
+  target_link_libraries(${TARGET_NAME} salmon_cg_cuda CUDA::cudart stdc++)
+endif()
+
 # Install binary
 install(TARGETS ${TARGET_NAME} DESTINATION "bin")
