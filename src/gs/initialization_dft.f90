@@ -309,7 +309,7 @@ real(8) :: rNe0,rNe
      end if
   end select
 
-  call calc_eigen_energy(energy,spsi,shpsi,sttpsi,system,info,mg,V_local,stencil,srg,ppg)
+  call calc_eigen_energy_ordered(energy,spsi,shpsi,sttpsi,system,info,mg,V_local,stencil,srg,ppg)
   if(yn_jm=='n') then
     rion_update = .true. ! it's first calculation
   else

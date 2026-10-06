@@ -16,6 +16,7 @@
 !--------10--------20--------30--------40--------50--------60--------70--------80--------90--------100-------110-------120-------130
 MODULE Total_Energy
 implicit none
+private :: calc_eigen_energy_body
 
 CONTAINS
 
@@ -520,10 +521,41 @@ CONTAINS
 !===================================================================================================================================
 
 ! eigen energies (esp), kinetic energy (E_kin), & nonlocal part of electron-ion energy (E_ion_nloc)
-  Subroutine calc_eigen_energy(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg)
+  ! Existing callers retain Hpsi dispatch; only the explicit DFT entry opts in.
+  subroutine calc_eigen_energy(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg)
+    use structures
+    implicit none
+    type(s_dft_energy)                     :: energy
+    type(s_orbital)                        :: tpsi,htpsi,ttpsi
+    type(s_dft_system)      ,intent(in)    :: system
+    type(s_parallel_info)   ,intent(in)    :: info
+    type(s_rgrid)           ,intent(in)    :: mg
+    type(s_scalar)          ,intent(in)    :: V_local(system%Nspin)
+    type(s_stencil)         ,intent(in)    :: stencil
+    type(s_sendrecv_grid)   ,intent(inout) :: srg
+    type(s_pp_grid)         ,intent(in)    :: ppg
+    call calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg,allow_cuda=.false.)
+  end subroutine calc_eigen_energy
+
+  subroutine calc_eigen_energy_ordered(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg)
+    use structures
+    implicit none
+    type(s_dft_energy)                     :: energy
+    type(s_orbital)                        :: tpsi,htpsi,ttpsi
+    type(s_dft_system)      ,intent(in)    :: system
+    type(s_parallel_info)   ,intent(in)    :: info
+    type(s_rgrid)           ,intent(in)    :: mg
+    type(s_scalar)          ,intent(in)    :: V_local(system%Nspin)
+    type(s_stencil)         ,intent(in)    :: stencil
+    type(s_sendrecv_grid)   ,intent(inout) :: srg
+    type(s_pp_grid)         ,intent(in)    :: ppg
+    call calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg,allow_cuda=.true.)
+  end subroutine calc_eigen_energy_ordered
+
+  Subroutine calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg,allow_cuda)
     use structures
     use communication, only: comm_summation
-    use hamiltonian, only: hpsi
+    use hamiltonian, only: hpsi,hpsi_ordered
     use pseudo_pt_so_sub, only: pseudo_so
     use salmon_global, only: yn_spinorbit
     use timer
@@ -538,6 +570,7 @@ CONTAINS
     type(s_stencil)         ,intent(in)    :: stencil
     type(s_sendrecv_grid)   ,intent(inout) :: srg
     type(s_pp_grid)         ,intent(in)    :: ppg
+    logical,intent(in) :: allow_cuda
     !
     integer :: ik,io,ispin,im,nk,no,is(3),ie(3),Nspin
     real(8) :: E_tmp,E_local(2),E_sum(2)
@@ -557,7 +590,11 @@ CONTAINS
     call timer_end(LOG_EIGEN_ENERGY_CALC)
 
     call timer_begin(LOG_EIGEN_ENERGY_HPSI)
+    if(allow_cuda)then
+      call hpsi_ordered(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
+    else
     call hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
+    endif
     call timer_end(LOG_EIGEN_ENERGY_HPSI)
 
     if(allocated(tpsi%rwf)) then
@@ -797,7 +834,7 @@ CONTAINS
     deallocate(wrk1,wrk2)
     call nvtxEndRange
     return
-  End Subroutine calc_eigen_energy
+  End Subroutine calc_eigen_energy_body
   
 !===================================================================================================================================
 

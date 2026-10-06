@@ -20,12 +20,44 @@ module hamiltonian
   use nvtx_wrapper
   implicit none
   integer,private,parameter :: Nd = 4
+  private :: hpsi_body
 
 contains
 
 !===================================================================================================================================
 
+! Existing entry retains its backend dispatch; explicit callers opt into ordered Hpsi.
 SUBROUTINE hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
+  use structures
+  implicit none
+  type(s_dft_system),intent(in) :: system
+  type(s_parallel_info),intent(in) :: info
+  type(s_rgrid),intent(in) :: mg
+  type(s_scalar),intent(in) :: V_local(system%Nspin)
+  type(s_stencil),intent(in) :: stencil
+  type(s_sendrecv_grid),intent(inout) :: srg
+  type(s_pp_grid),intent(in) :: ppg
+  type(s_orbital) :: tpsi,htpsi
+  type(s_orbital),optional :: ttpsi
+  call hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,allow_cuda=.false.)
+end subroutine hpsi
+
+SUBROUTINE hpsi_ordered(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
+  use structures
+  implicit none
+  type(s_dft_system),intent(in) :: system
+  type(s_parallel_info),intent(in) :: info
+  type(s_rgrid),intent(in) :: mg
+  type(s_scalar),intent(in) :: V_local(system%Nspin)
+  type(s_stencil),intent(in) :: stencil
+  type(s_sendrecv_grid),intent(inout) :: srg
+  type(s_pp_grid),intent(in) :: ppg
+  type(s_orbital) :: tpsi,htpsi
+  type(s_orbital),optional :: ttpsi
+  call hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,allow_cuda=.true.)
+end subroutine hpsi_ordered
+
+SUBROUTINE hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,allow_cuda)
   use structures
   use stencil_sub
   use nonlocal_potential
@@ -36,7 +68,10 @@ SUBROUTINE hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
   use salmon_global, only: yn_want_communication_overlapping,yn_periodic,yn_jm,yn_symmetrized_stencil, &
           absorbing_boundary, yn_spinorbit
   use timer
-  use code_optimization, only: stencil_is_parallelized_by_omp
+  use code_optimization, only: stencil_is_parallelized_by_omp,optimized_stencil_is_callable
+#ifdef SALMON_SHARED_HPSI
+  use hpsi_cuda_bridge
+#endif
   use communication, only: comm_summation
   implicit none
 
@@ -53,6 +88,10 @@ SUBROUTINE hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
   type(s_pp_grid),intent(in) :: ppg
   type(s_orbital)            :: tpsi,htpsi
   type(s_orbital),optional   :: ttpsi
+  logical,intent(in) :: allow_cuda
+#ifdef SALMON_SHARED_HPSI
+  type(hpsi_cuda_state) :: cuda_hpsi
+#endif
   !
   integer :: nspin,ispin,io,ik,im,im_s,im_e,ik_s,ik_e,io_s,io_e,norb,ix,iy,iz
   real(8) :: k_nabt(Nd,3),k_lap0,kAc(3)
@@ -145,6 +184,15 @@ SUBROUTINE hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
 
   ! stencil
     call timer_begin(LOG_UHPSI_STENCIL)
+#ifdef SALMON_SHARED_HPSI
+    if(allow_cuda)then
+      call hpsi_cuda_begin(cuda_hpsi,mg,system,info,stencil,ppg,V_local,tpsi,htpsi, &
+           yn_spinorbit=='n'.and.yn_periodic=='y'.and.yn_jm=='n'.and. &
+           absorbing_boundary/='z'.and..not.PLUS_U_ON.and..not.system%xc_payload%use_tau_operator.and. &
+           .not.optimized_stencil_is_callable.and..not.stencil_is_parallelized_by_omp,tx=ttpsi)
+    endif
+    if(.not.hpsi_cuda_active(cuda_hpsi))then
+#endif
     if(stencil%if_orthogonal .and. .not.if_singlescale) then
     ! orthogonal lattice (general)
     
@@ -372,6 +420,9 @@ SUBROUTINE hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
 #endif
       
     end if
+#ifdef SALMON_SHARED_HPSI
+    endif
+#endif
     call timer_end(LOG_UHPSI_STENCIL)
 
   ! subtraction
@@ -445,6 +496,11 @@ SUBROUTINE hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
 
   ! nonlocal potential
     call nvtxStartRange('nonlocal potential', __LINE__)
+#ifdef SALMON_SHARED_HPSI
+    if(hpsi_cuda_active(cuda_hpsi))then
+      call hpsi_cuda_finish(cuda_hpsi,htpsi)
+    else
+#endif
     if(yn_jm=='n') then
       if ( yn_spinorbit=='y' ) then
         call op_xc_noncollinear( tpsi, htpsi, info, mg )
@@ -457,6 +513,9 @@ SUBROUTINE hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
         call pseudo_plusU(tpsi,htpsi,system,info,ppg)
       end if
     end if
+#ifdef SALMON_SHARED_HPSI
+    endif
+#endif
     call nvtxEndRange()
 
     ! meta-GGA: tau-operator part of Vxc
@@ -839,7 +898,7 @@ contains
 
   end subroutine add_imaginary_potential_for_absorbing_boundary_z
 
-end subroutine hpsi
+end subroutine hpsi_body
 
 !===================================================================================================================================
 

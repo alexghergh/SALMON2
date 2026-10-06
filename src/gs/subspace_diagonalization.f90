@@ -250,7 +250,7 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   use structures
   use communication, only: comm_summation,comm_bcast
   use timer
-  use hamiltonian, only: hpsi
+  use hamiltonian, only: hpsi_ordered
   use eigen_subdiag_sub
   use sendrecv_grid, only: s_sendrecv_grid
   use pack_unpack, only: copy_data
@@ -307,7 +307,7 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
 #endif
 
   call timer_begin(LOG_SSDG_PERIODIC_HPSI)
-  call hpsi(spsi,shpsi,info,mg,vlocal,system,stencil,srg,ppg)
+  call hpsi_ordered(spsi,shpsi,info,mg,vlocal,system,stencil,srg,ppg)
   call timer_end(LOG_SSDG_PERIODIC_HPSI)
 
   nsize_rg = (mg%ie(1)-mg%is(1)+1)*(mg%ie(2)-mg%is(2)+1)*(mg%ie(3)-mg%is(3)+1)

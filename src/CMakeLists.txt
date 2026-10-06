@@ -44,10 +44,15 @@ if(SALMON_CG_CUDA)
                  APPEND PROPERTY COMPILE_DEFINITIONS SALMON_SUBSPACE_ORDERED)
   endif()
   if(SALMON_CG_ORDERED_NONLOCAL)
-    target_sources(salmon_cg_cuda PRIVATE gs/cg_nonlocal_ordered.cu gs/cg_stencil_ordered.cu)
+    target_sources(salmon_cg_cuda PRIVATE gs/cg_nonlocal_ordered.cu gs/cg_stencil_ordered.cu common/hpsi_cuda_maps.cu)
     target_compile_definitions(salmon_cg_cuda PRIVATE SALMON_CG_ORDERED_NONLOCAL)
     set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/atom/pp/prep_pp.f90
                  APPEND PROPERTY COMPILE_DEFINITIONS SALMON_CG_ORDERED_NONLOCAL)
+  endif()
+  if(SALMON_SHARED_HPSI)
+    target_sources(salmon_cg_cuda PRIVATE common/hpsi_cuda_call.cu)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/common/hamiltonian.f90
+                 APPEND PROPERTY COMPILE_DEFINITIONS SALMON_SHARED_HPSI)
   endif()
   set_target_properties(salmon_cg_cuda PROPERTIES
     CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
