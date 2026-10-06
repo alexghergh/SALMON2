@@ -3,9 +3,15 @@
 // ZGEMM of the OpenBLAS-based BLAS bundled with NVHPC, as dispatched to its SSE3 kernels on the
 // Xeon test host. Written from that operation order, not from the BLAS source.
 #include "subspace_gemm_ordered.h"
+#include <cstdio>
 
 namespace {
 constexpr int points = 4096, states = 80;
+
+template<bool padded> __device__ __forceinline__ int field_index(int point, int orbital) {
+    if constexpr (padded) return point % 256 + 272 * (point / 256) + 4352 * orbital;
+    return point + points * orbital;
+}
 
 // The CPU kernel forms all four alpha products even when alpha is real. Separately rounded
 // operations keep that expression tree and the update of C after each panel.
@@ -18,8 +24,13 @@ __device__ __forceinline__ double2 update(double r, double i, double ar, double 
 
 // One thread owns one output. Shared tiles move inputs only: no parallel reduction.
 // The CN call runs over 32 ascending K panels of 128 points; C is rounded after each panel.
-__global__ void cn80(const double2 *a, const double2 *b, double2 *c,
+template<bool padded> __global__ void cn80(const double2 *a, const double2 *b, double2 *c,
                      double ar, double ai) {
+    if constexpr (padded) {
+        a += size_t(blockIdx.z) * 4352 * states;
+        b += size_t(blockIdx.z) * 4352 * states;
+        c += size_t(blockIdx.z) * states * states;
+    }
     constexpr int tile = 8, chunk = 32, panel = 128;
     __shared__ double2 sa[tile][chunk], sb[tile][chunk];
     const int row = int(blockIdx.x) * tile + int(threadIdx.x);
@@ -31,8 +42,8 @@ __global__ void cn80(const double2 *a, const double2 *b, double2 *c,
         for (int base = start; base < start + panel; base += chunk) {
             for (int t = tid; t < tile * chunk; t += tile * tile) {
                 const int v = t / chunk, q = t % chunk;
-                sa[v][q] = a[base + q + points * (int(blockIdx.x) * tile + v)];
-                sb[v][q] = b[base + q + points * (int(blockIdx.y) * tile + v)];
+                sa[v][q] = a[field_index<padded>(base + q, int(blockIdx.x) * tile + v)];
+                sb[v][q] = b[field_index<padded>(base + q, int(blockIdx.y) * tile + v)];
             }
             __syncthreads();
             #pragma unroll 1
@@ -55,8 +66,13 @@ __global__ void cn80(const double2 *a, const double2 *b, double2 *c,
 
 // NN has one K=80 panel. The CPU's 224/144-row and 6/2-column packing partitions
 // independent outputs, so they need not be duplicated as GPU launch partitions.
-__global__ void nn80(const double2 *a, const double2 *e, double2 *c,
+template<bool padded> __global__ void nn80(const double2 *a, const double2 *e, double2 *c,
                      double ar, double ai) {
+    if constexpr (padded) {
+        a += size_t(blockIdx.z) * 4352 * states;
+        e += size_t(blockIdx.z) * states * states;
+        c += size_t(blockIdx.z) * 4352 * states;
+    }
     constexpr int rows = 16, cols = 8, chunk = 16;
     __shared__ double2 sa[chunk][rows], se[cols][chunk];
     const int row = int(blockIdx.x) * rows + int(threadIdx.x);
@@ -66,7 +82,7 @@ __global__ void nn80(const double2 *a, const double2 *e, double2 *c,
     for (int base = 0; base < states; base += chunk) {
         for (int t = tid; t < rows * chunk; t += rows * cols) {
             const int q = t / rows, r = t % rows;
-            sa[q][r] = a[int(blockIdx.x) * rows + r + points * (base + q)];
+            sa[q][r] = a[field_index<padded>(int(blockIdx.x) * rows + r, base + q)];
         }
         for (int t = tid; t < cols * chunk; t += rows * cols) {
             const int j = t / chunk, q = t % chunk;
@@ -83,7 +99,7 @@ __global__ void nn80(const double2 *a, const double2 *e, double2 *c,
         }
         __syncthreads();
     }
-    const int offset = row + points * col;
+    const int offset = field_index<padded>(row, col);
     c[offset] = update(__dsub_rn(rr, ii), __dadd_rn(ir, ri), ar, ai, c[offset]);
 }
 } // namespace
@@ -93,7 +109,7 @@ extern "C" int salmon_subspace_cn80_ordered(const double2 *a, const double2 *b,
     if (!a || !b || !c || a == c || b == c) return int(cudaErrorInvalidValue);
     if (ar == 0.0 && ai == 0.0)
         return int(cudaMemsetAsync(c, 0, states * states * sizeof(double2)));
-    cn80<<<dim3(states / 8, states / 8), dim3(8, 8)>>>(a, b, c, ar, ai);
+    cn80<false><<<dim3(states / 8, states / 8), dim3(8, 8)>>>(a, b, c, ar, ai);
     return int(cudaGetLastError());
 }
 
@@ -101,6 +117,39 @@ extern "C" int salmon_subspace_nn80_ordered(const double2 *a, const double2 *e,
                                            double2 *c, double ar, double ai) {
     if (!a || !e || !c || a == c || e == c) return int(cudaErrorInvalidValue);
     if (ar == 0.0 && ai == 0.0) return int(cudaSuccess); // beta=1; original early return
-    nn80<<<dim3(points / 16, states / 8), dim3(16, 8)>>>(a, e, c, ar, ai);
+    nn80<false><<<dim3(points / 16, states / 8), dim3(16, 8)>>>(a, e, c, ar, ai);
     return int(cudaGetLastError());
+}
+
+extern "C" int salmon_subspace_cn80_padded_batch(const double2 *a, const double2 *b,
+                                                double2 *c, double ar, double ai, int nk) {
+    if (!a || !b || !c || a == c || b == c || nk < 1 || nk > 65535)
+        return int(cudaErrorInvalidValue);
+    if (ar == 0.0 && ai == 0.0)
+        return int(cudaMemsetAsync(c, 0, size_t(nk) * states * states * sizeof(double2)));
+    const dim3 grid(states / 8, states / 8, nk), block(8, 8);
+    cn80<true><<<grid, block>>>(a, b, c, ar, ai);
+    const int rc=int(cudaGetLastError());
+    if (!rc) {
+        std::printf("SUBSPACE_CONNECTED_LAUNCH CN grid=%u,%u,%u block=%u,%u,%u\n",
+                    grid.x,grid.y,grid.z,block.x,block.y,block.z);
+        std::fflush(stdout);
+    }
+    return rc;
+}
+
+extern "C" int salmon_subspace_nn80_padded_batch(const double2 *a, const double2 *e,
+                                                double2 *c, double ar, double ai, int nk) {
+    if (!a || !e || !c || a == c || e == c || nk < 1 || nk > 65535)
+        return int(cudaErrorInvalidValue);
+    if (ar == 0.0 && ai == 0.0) return int(cudaSuccess);
+    const dim3 grid(points / 16, states / 8, nk), block(16, 8);
+    nn80<true><<<grid, block>>>(a, e, c, ar, ai);
+    const int rc=int(cudaGetLastError());
+    if (!rc) {
+        std::printf("SUBSPACE_CONNECTED_LAUNCH NN grid=%u,%u,%u block=%u,%u,%u\n",
+                    grid.x,grid.y,grid.z,block.x,block.y,block.z);
+        std::fflush(stdout);
+    }
+    return rc;
 }

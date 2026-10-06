@@ -54,6 +54,11 @@ if(SALMON_CG_CUDA)
     set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/common/hamiltonian.f90
                  APPEND PROPERTY COMPILE_DEFINITIONS SALMON_SHARED_HPSI)
   endif()
+  if(SALMON_SUBSPACE_CONNECTED)
+    target_sources(salmon_cg_cuda PRIVATE gs/subspace_connected_context.cu)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/gs/subspace_diagonalization.f90
+                 APPEND PROPERTY COMPILE_DEFINITIONS SALMON_SUBSPACE_CONNECTED)
+  endif()
   set_target_properties(salmon_cg_cuda PROPERTIES
     CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
     CUDA_ARCHITECTURES "${SALMON_CG_CUDA_ARCH}"

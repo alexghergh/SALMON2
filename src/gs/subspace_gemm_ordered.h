@@ -9,3 +9,10 @@ extern "C" int salmon_subspace_cn80_ordered(const double2 *a, const double2 *b,
                                            double2 *c, double ar, double ai);
 extern "C" int salmon_subspace_nn80_ordered(const double2 *a, const double2 *e,
                                            double2 *c, double ar, double ai);
+
+// Same arithmetic, independent local-k batches; fields are padded (16,17,16,80,nk).
+// Only physical field cells are read/written. Matrices are dense (80,80,nk).
+extern "C" int salmon_subspace_cn80_padded_batch(const double2 *a, const double2 *b,
+                                                double2 *c, double ar, double ai, int nk);
+extern "C" int salmon_subspace_nn80_padded_batch(const double2 *a, const double2 *e,
+                                                double2 *c, double ar, double ai, int nk);

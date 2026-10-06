@@ -21,7 +21,7 @@ module subspace_diagonalization
 
 contains
 
-subroutine ssdg(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
+subroutine ssdg(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg,retain_workspace_outputs)
   use structures
   use salmon_global, only: yn_diagonalization_red_mem,yn_spinorbit
   use communication, only: comm_summation,comm_bcast
@@ -40,6 +40,9 @@ subroutine ssdg(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   type(s_scalar) ,intent(in) :: vlocal(system%nspin)
   type(s_orbital)            :: spsi,shpsi
   type(s_sendrecv_grid)      :: srg
+  ! .false. lets the GPU path of SALMON_SUBSPACE_CONNECTED skip returning Hpsi in shpsi.
+  ! All other paths (CPU, OpenACC, unsupported cases) always return it.
+  logical,optional,intent(in) :: retain_workspace_outputs
 
   if ( yn_spinorbit=='y' ) then
      call ssdg_so(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
@@ -54,7 +57,7 @@ subroutine ssdg(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
     !call ssdg_rwf(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg) !old fashion
     end if
   else
-    call ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
+    call ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg,retain_workspace_outputs)
     !call ssdg_zwf(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg) !old fashion
   end if
 end subroutine
@@ -241,11 +244,14 @@ end subroutine ssdg_rwf
 
 !===================================================================================================================================
 
-subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
+subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg,retain_workspace_outputs)
   use salmon_global, only: yn_scalapack
 #ifdef SALMON_SUBSPACE_ORDERED
   use salmon_global, only: yn_spinorbit
   use subspace_ordered_context
+#endif
+#ifdef SALMON_SUBSPACE_CONNECTED
+  use subspace_connected_context
 #endif
   use structures
   use communication, only: comm_summation,comm_bcast
@@ -263,6 +269,7 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   type(s_scalar) ,intent(in) :: vlocal(system%nspin)
   type(s_orbital)            :: spsi,shpsi
   type(s_sendrecv_grid)      :: srg
+  logical,optional,intent(in) :: retain_workspace_outputs
 
   complex(8),parameter :: zero = 0d0, one = 1d0
   integer :: im,ispin,ik,io,jo,io1,io2,nsize_rg,m
@@ -275,7 +282,11 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   real(8) :: eval(system%no)
 #ifdef SALMON_SUBSPACE_ORDERED
   type(subspace_workspace) :: ordered_workspace
-  logical :: ordered
+  logical :: ordered,ordered_requested,connected_requested
+#endif
+#ifdef SALMON_SUBSPACE_CONNECTED
+  type(connected_subspace) :: connected_workspace
+  logical :: keep_workspace
 #endif
 
 #ifdef USE_OPENACC
@@ -287,7 +298,12 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   ! The CUDA ZGEMMs handle only 80 complex orbitals on an undivided 16^3 grid. Other layouts
   ! keep the CPU path; decide before any device allocation or change to host data.
   ordered=.false.
-  if(subspace_requested()) then
+  ordered_requested=subspace_requested()
+  connected_requested=.false.
+#ifdef SALMON_SUBSPACE_CONNECTED
+  connected_requested=subspace_connected_requested()
+#endif
+  if(ordered_requested.or.connected_requested) then
     if(.not.system%if_real_orbital.and.system%nspin==1.and.system%no==80.and. &
        yn_spinorbit=='n'.and.yn_scalapack=='n'.and.all(mg%ie-mg%is+1==16).and. &
        .not.info%if_divide_orbit.and..not.info%if_divide_rspace.and. &
@@ -304,6 +320,40 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
       endif
     endif
   endif
+#ifdef SALMON_SUBSPACE_CONNECTED
+  if(connected_requested.and.ordered)then
+    call timer_begin(LOG_SSDG_PERIODIC_HPSI)
+    call subspace_connected_begin(connected_workspace,mg,system,info,stencil,ppg,vlocal,spsi,shpsi)
+    call timer_end(LOG_SSDG_PERIODIC_HPSI)
+    if(subspace_connected_active(connected_workspace))then
+      keep_workspace=.true.
+      if(present(retain_workspace_outputs))keep_workspace=retain_workspace_outputs
+      call timer_begin(LOG_SSDG_PERIODIC_CALC)
+      call subspace_connected_overlap(connected_workspace,system%hvol,shpsi,keep_workspace)
+      call timer_end(LOG_SSDG_PERIODIC_CALC)
+      ! Eligible spin/image and orbital/spatial communicator extents are one.
+      ! Independent overlaps are batched; the original CPU solve remains ascending-k.
+      do ik=info%ik_s,info%ik_e
+        call timer_begin(LOG_SSDG_PERIODIC_CALC)
+        call subspace_connected_matrix(connected_workspace,ik-info%ik_s+1,hmat)
+        call timer_end(LOG_SSDG_PERIODIC_CALC)
+        call timer_begin(LOG_SSDG_PERIODIC_EIGEN)
+        call eigen_zheev(hmat,eval,evec)
+        call timer_end(LOG_SSDG_PERIODIC_EIGEN)
+        call timer_begin(LOG_SSDG_PERIODIC_CALC)
+        call subspace_connected_eigenvectors(connected_workspace,ik-info%ik_s+1,evec)
+        call timer_end(LOG_SSDG_PERIODIC_CALC)
+      enddo
+      call timer_begin(LOG_SSDG_PERIODIC_CALC)
+      call subspace_connected_end(connected_workspace,spsi)
+      call timer_end(LOG_SSDG_PERIODIC_CALC)
+      return
+    endif
+  endif
+#endif
+  ! If SALMON_SUBSPACE_CONNECTED could not be used, use the CUDA ZGEMMs only if
+  ! SALMON_SUBSPACE_ORDERED is also set.
+  ordered=ordered.and.ordered_requested
 #endif
 
   call timer_begin(LOG_SSDG_PERIODIC_HPSI)

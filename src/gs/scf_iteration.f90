@@ -58,7 +58,10 @@ subroutine solve_orbitals(mg,system,info,stencil,spsi,shpsi,sttpsi,srg,cg,ppg,vl
   call timer_begin(LOG_CALC_SUBSPACE_DIAG)
   if(yn_subspace_diagonalization == 'y')then
     if(miter > nscf_init_no_diagonal)then
-      call ssdg(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
+      ! Both CG routes initialize Hpsi before reading it, including zero iterations.
+      ! So the GPU path of SALMON_SUBSPACE_CONNECTED may leave shpsi unset here.
+      call ssdg(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg, &
+                retain_workspace_outputs=keep_workspaces)
     end if
   end if
   call timer_end(LOG_CALC_SUBSPACE_DIAG)
