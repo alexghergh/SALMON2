@@ -369,7 +369,7 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   use structures
 #ifdef SALMON_CG_CUDA
   use cg_resident_bridge, only: cg_region_state,cg_region_begin,cg_region_products_check, &
-       cg_region_finish,cg_region_update_check,cg_region_report
+       cg_region_finish,cg_region_update_check,cg_region_report,cg_region_accept,cg_region_end
 #endif
   use timer
   use hamiltonian, only: hpsi
@@ -559,7 +559,7 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
     call timer_begin(LOG_GSCG_PERIODIC_CALC)
 
 #ifdef SALMON_CG_CUDA
-    call cg_region_begin(cuda_region,mg,system,info,xk,cg%pk,hxk,cg%hpk,gk,yn_spinorbit,wtmp2)
+    call cg_region_begin(cuda_region,mg,system,info,xk,cg%pk,hxk,cg%hpk,gk,yn_spinorbit,wtmp2,icg)
     if(cuda_region%mode/=2)then
 #endif
     call inner_product(mg,system,info,xk,   xk,    wtmp2(1,:,:,:))
@@ -658,6 +658,10 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
     end do
     end do
 
+#ifdef SALMON_CG_CUDA
+    ! Update x on the CPU, unless port mode keeps x and Hx on the GPU across iterations.
+    if(.not.(cuda_region%resident.and.cuda_region%mode==2))then
+#endif
 #ifdef USE_OPENACC
 !$acc parallel loop private(ik,io,ispin,iz,iy) collapse(5)
 #else
@@ -679,7 +683,15 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
     end do
     end do
 
+#ifdef SALMON_CG_CUDA
+    endif
+    call cg_region_accept(cuda_region,system,info,bk,xk)
+#endif
   end do ! icg
+#ifdef SALMON_CG_CUDA
+  ! All three loop-head exits and the Ncg+1 limit reach this single flush.
+  call cg_region_end(cuda_region,xk,hxk)
+#endif
 
   deallocate( utmp3,wtmp2 )
   deallocate( bk,gkgk,E1,E,rb,res )

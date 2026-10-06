@@ -86,6 +86,19 @@ __global__ void gradient_norm(Grid q,const double2 *x,const double2 *p,double2 *
 }
 
 
+// Same complex multiply/add tree as the CPU update of x in gscg_zwf (where bk < 0).
+// As on the CPU, an orbital whose step is rejected keeps x, but Hx is already updated.
+__global__ void accepted_x(Grid q,double2 *x,const double2 *p,const double2 *u,const double *bk){
+    size_t id=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    const size_t physical=size_t(q.nx)*q.ny*q.nz;
+    if(id>=physical*q.nv)return;
+    int v=id/physical;size_t j=id%physical;
+    if(!(bk[v]<0.))return;
+    int ix=j%q.nx,iy=(j/q.nx)%q.ny,iz=j/(size_t(q.nx)*q.ny);
+    size_t i=q.at(ix,iy,iz,v);
+    x[i]=sum(multiply(u[2*v],x[i]),multiply(u[2*v+1],p[i]));
+}
+
 struct Context {
     Grid q;
     size_t bytes,physical;
@@ -141,8 +154,8 @@ extern "C" int salmon_cg_begin(int nx,int ny,int nz,int nv,int pady,double h,
     *handle=c;return 0;
 #undef TRY
 }
-extern "C" int salmon_cg_finish(void *handle,const double2 *u,const double *e,
- double2 *hx,double2 *g,double2 *norm,int fused){
+static int finish(void *handle,const double2 *u,const double *e,
+ double2 *hx,double2 *g,double2 *norm,int fused,bool copy_hx){
     auto *c=static_cast<Context*>(handle);
     if(!c||!u||!e||!hx||!g||!norm||(fused!=0&&fused!=1))return -1;
     int rc;
@@ -157,11 +170,52 @@ extern "C" int salmon_cg_finish(void *handle,const double2 *u,const double *e,
         gradient_norm<false><<<(nv+127)/128,128>>>(c->q,c->x,c->p,c->hx,c->hp,c->u,c->e,c->g,c->h,c->norm);
     }
     TRY(cudaGetLastError());
-    TRY(cudaMemcpy(hx,c->hx,c->bytes,cudaMemcpyDeviceToHost));
+    if(copy_hx)TRY(cudaMemcpy(hx,c->hx,c->bytes,cudaMemcpyDeviceToHost));
     // Copy only physical rows; leave caller gradient padding byte-for-byte untouched.
     TRY(cudaMemcpy2D(g,c->q.plane*sizeof(double2),c->g,c->q.plane*sizeof(double2),
                      size_t(c->q.nx)*c->q.ny*sizeof(double2),size_t(c->q.nz)*nv,cudaMemcpyDeviceToHost));
     TRY(cudaMemcpy(norm,c->norm,nv*sizeof(double2),cudaMemcpyDeviceToHost));
     return 0;
 #undef TRY
+}
+
+// Existing one-step ABI and arithmetic stay available without residency.
+extern "C" int salmon_cg_finish(void *handle,const double2 *u,const double *e,
+ double2 *hx,double2 *g,double2 *norm,int fused){
+    return finish(handle,u,e,hx,g,norm,fused,true);
+}
+extern "C" int salmon_cg_retained_finish(void *handle,const double2 *u,const double *e,
+ double2 *hx,double2 *g,double2 *norm,int copy_hx){
+    if(copy_hx!=0&&copy_hx!=1)return -1;
+    return finish(handle,u,e,hx,g,norm,0,copy_hx!=0);
+}
+extern "C" int salmon_cg_refresh(void *handle,const double2 *p,const double2 *hp,double2 *six){
+    auto *c=static_cast<Context*>(handle);if(!c||!p||!hp||!six)return -1;
+    int rc=salmon_cg_device_guard();if(rc)return rc;
+#define TRY(cmd) do{rc=int(cmd);if(rc)return rc;}while(0)
+    // CPU direction/Hpsi remain the producers; x and Hx are already current here.
+    TRY(cudaMemcpy(c->p,p,c->bytes,cudaMemcpyHostToDevice));
+    TRY(cudaMemcpy(c->hp,hp,c->bytes,cudaMemcpyHostToDevice));
+    six_ordered<<<(size_t(c->q.nv)+127)/128,128>>>(c->q,c->x,c->p,c->hx,c->hp,c->h,c->six);
+    TRY(cudaGetLastError());
+    TRY(cudaMemcpy(six,c->six,size_t(c->q.nv)*6*sizeof(double2),cudaMemcpyDeviceToHost));
+    return 0;
+#undef TRY
+}
+extern "C" int salmon_cg_accept(void *handle,const double *bk){
+    auto *c=static_cast<Context*>(handle);if(!c||!bk)return -1;
+    int rc;
+#define TRY(cmd) do{rc=int(cmd);if(rc)return rc;}while(0)
+    // E has no device consumer after finish. Reuse that small buffer for bk.
+    TRY(cudaMemcpy(c->e,bk,size_t(c->q.nv)*sizeof(double),cudaMemcpyHostToDevice));
+    accepted_x<<<(c->physical+127)/128,128>>>(c->q,c->x,c->p,c->u,c->e);
+    TRY(cudaGetLastError());
+    TRY(cudaDeviceSynchronize());
+    return 0;
+#undef TRY
+}
+extern "C" int salmon_cg_snapshot(void *handle,double2 *x,double2 *hx){
+    auto *c=static_cast<Context*>(handle);if(!c||!x||!hx)return -1;
+    int rc=int(cudaMemcpy(x,c->x,c->bytes,cudaMemcpyDeviceToHost));if(rc)return rc;
+    return int(cudaMemcpy(hx,c->hx,c->bytes,cudaMemcpyDeviceToHost));
 }

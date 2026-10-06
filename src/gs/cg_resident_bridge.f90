@@ -8,14 +8,18 @@ module cg_resident_bridge
   private
   public :: cg_region_state,cg_region_begin,cg_region_products_check,cg_region_finish
   public :: cg_region_update_check,cg_region_report,cg_region_real_fallback
+  public :: cg_region_accept,cg_region_end
   type cg_region_state
     type(c_ptr) :: handle=c_null_ptr
     integer :: mode=0
+    logical :: resident=.false.,awaiting_accept=.false.
+    integer :: next_iteration=0,layout(18)=0
+    integer(c_int64_t) :: hvol_bits=0
     complex(c_double_complex),allocatable :: six(:,:,:,:),norm(:,:,:)
     complex(c_double_complex),allocatable :: hx(:,:,:,:,:,:,:),g(:,:,:,:,:,:,:)
   end type
   logical,save :: initialized=.false.
-  integer,save :: selected=0,fused=0
+  integer,save :: selected=0,fused=0,retain=0
   ! Call counts per path: off, real orbitals, spin-orbit, OpenACC, divided r-space, layout,
   ! no device, shadow, port
   integer(c_int64_t),save :: paths(9)=0
@@ -40,6 +44,35 @@ module cg_resident_bridge
       complex(c_double_complex),intent(in) :: u(*)
       real(c_double),intent(in) :: e(*)
       complex(c_double_complex),intent(out) :: hx(*),g(*),norm(*)
+      integer(c_int) :: rc
+    end function
+    function refresh_gpu(handle,p,hp,six) bind(C,name='salmon_cg_refresh') result(rc)
+      import c_int,c_double_complex,c_ptr
+      type(c_ptr),value :: handle
+      complex(c_double_complex),intent(in) :: p(*),hp(*)
+      complex(c_double_complex),intent(out) :: six(*)
+      integer(c_int) :: rc
+    end function
+    function retained_finish_gpu(handle,u,e,hx,g,norm,copy_hx) bind(C,name='salmon_cg_retained_finish') result(rc)
+      import c_int,c_double,c_double_complex,c_ptr
+      type(c_ptr),value :: handle
+      integer(c_int),value :: copy_hx
+      complex(c_double_complex),intent(in) :: u(*)
+      real(c_double),intent(in) :: e(*)
+      complex(c_double_complex),intent(inout) :: hx(*),g(*)
+      complex(c_double_complex),intent(out) :: norm(*)
+      integer(c_int) :: rc
+    end function
+    function accept_gpu(handle,bk) bind(C,name='salmon_cg_accept') result(rc)
+      import c_int,c_double,c_ptr
+      type(c_ptr),value :: handle
+      real(c_double),intent(in) :: bk(*)
+      integer(c_int) :: rc
+    end function
+    function snapshot_gpu(handle,x,hx) bind(C,name='salmon_cg_snapshot') result(rc)
+      import c_int,c_double_complex,c_ptr
+      type(c_ptr),value :: handle
+      complex(c_double_complex),intent(out) :: x(*),hx(*)
       integer(c_int) :: rc
     end function
     function close_gpu(handle) bind(C,name='salmon_cg_close') result(rc)
@@ -68,6 +101,14 @@ contains
     case('1'); error stop 'Fused update/norm is rejected in this source trial'
     case default; error stop 'SALMON_CG_CUDA_FUSED must be 0 or 1'
     end select
+    setting='';call get_environment_variable('SALMON_CG_CUDA_RETAIN',setting,status=status)
+    if(status/=0.and.status/=1)error stop 'SALMON_CG_CUDA_RETAIN unreadable or truncated'
+    select case(trim(setting))
+    case('','0'); retain=0
+    case('1'); retain=1
+    case default; error stop 'SALMON_CG_CUDA_RETAIN must be 0 or 1'
+    end select
+    write(*,*) 'CG_CUDA RETAIN=',retain
     write(*,*) 'CG_CUDA CONFIG mode(0=off,1=shadow,2=port)=',selected,' fused=',fused
     initialized=.true.
   end subroutine
@@ -84,7 +125,7 @@ contains
        all(ubound(w%zwf)==[mg%ie+[0,pady,0],system%nspin,info%io_e,info%ik_e,1])
   end function
 
-  subroutine cg_region_begin(s,mg,system,info,x,p,hx,hp,g,spinorbit,products)
+  subroutine cg_region_begin(s,mg,system,info,x,p,hx,hp,g,spinorbit,products,iteration)
     type(cg_region_state),intent(inout) :: s
     type(s_rgrid),intent(in) :: mg
     type(s_dft_system),intent(in) :: system
@@ -92,12 +133,26 @@ contains
     type(s_orbital),intent(in) :: x,p,hx,hp,g
     character(*),intent(in) :: spinorbit
     complex(8),intent(inout) :: products(:,:,:,:)
+    integer,intent(in),optional :: iteration
     complex(c_double_complex),allocatable :: packed(:,:)
-    integer :: nv,v,ik,io,ispin,ns(3),pady
+    integer :: nv,v,ik,io,ispin,ns(3),pady,key(18)
     integer(c_int) :: rc
     integer(c_int64_t) :: nv64
     call settings()
-    if(c_associated(s%handle))error stop 'CG context already active'
+    if(c_associated(s%handle))then
+      if(.not.s%resident.or..not.present(iteration))call context_error(s,'CG context already active')
+      if(iteration/=s%next_iteration.or.s%awaiting_accept)call context_error(s,'CG iteration sequence changed')
+      ! These values and arrays do not change within one gscg_zwf call. Once x/Hx live on the GPU,
+      ! a mismatch is an error: a CPU fallback would read stale host copies of x/Hx.
+      pady=s%layout(18)
+      key=[mg%is,mg%ie,system%nspin,system%no,system%nk,info%io_s,info%io_e, &
+           info%ik_s,info%ik_e,info%isize_r,info%id_rko,info%im_s,info%im_e,pady]
+      if(any(key/=s%layout).or.transfer(system%hvol,0_c_int64_t)/=s%hvol_bits.or. &
+         spinorbit/='n'.or.selected/=s%mode)call context_error(s,'CG resident descriptor changed')
+      if(.not.owned_rectangle(x,mg,system,info,pady).or..not.owned_rectangle(p,mg,system,info,pady).or. &
+         .not.owned_rectangle(hx,mg,system,info,pady).or..not.owned_rectangle(hp,mg,system,info,pady).or. &
+         .not.owned_rectangle(g,mg,system,info,pady))call context_error(s,'CG resident storage changed')
+    endif
     s%mode=0
     if(selected==0)then
       paths(1)=paths(1)+1;return
@@ -132,13 +187,26 @@ contains
       error stop 'invalid CG ownership bounds'
     rc=device_guard()
     if(rc/=0)then
+      if(c_associated(s%handle))call context_error(s,'CG resident device changed')
       paths(7)=paths(7)+1
       if(paths(7)==1)write(*,*) 'CG_CUDA device fallback status=',rc,' rank=',info%id_rko
       return
     endif
     nv=int(nv64);allocate(packed(6,nv))
-    rc=begin_gpu(ns(1),ns(2),ns(3),nv,pady,system%hvol,x%zwf,p%zwf,hx%zwf,hp%zwf,packed,s%handle)
-    call require_success(rc,'begin')
+    if(c_associated(s%handle))then
+      rc=refresh_gpu(s%handle,p%zwf,hp%zwf,packed)
+    else
+      rc=begin_gpu(ns(1),ns(2),ns(3),nv,pady,system%hvol,x%zwf,p%zwf,hx%zwf,hp%zwf,packed,s%handle)
+      s%resident=retain==1.and.present(iteration)
+      if(s%resident)then
+        if(iteration<1)call context_error(s,'CG invalid initial iteration')
+        s%next_iteration=iteration
+        s%layout=[mg%is,mg%ie,system%nspin,system%no,system%nk,info%io_s,info%io_e, &
+                  info%ik_s,info%ik_e,info%isize_r,info%id_rko,info%im_s,info%im_e,pady]
+        s%hvol_bits=transfer(system%hvol,0_c_int64_t)
+      endif
+    endif
+    call require_success(rc,'begin/refresh',s)
     allocate(s%six(6,system%nspin,system%no,system%nk));s%six=0.d0
     v=0
     do ik=info%ik_s,info%ik_e
@@ -177,6 +245,7 @@ contains
     integer :: v,nv,ik,io,ispin
     integer(c_int) :: rc,close_rc
     if(s%mode==0)return
+    if(s%resident.and.s%awaiting_accept)call context_error(s,'CG repeated resident finish')
     nv=system%nspin*(info%io_e-info%io_s+1)*(info%ik_e-info%ik_s+1)
     allocate(up(2,nv),ep(nv),np(nv));v=0
     do ik=info%ik_s,info%ik_e
@@ -189,12 +258,25 @@ contains
     if(s%mode==1)then
       allocate(s%hx,mold=hx%zwf);allocate(s%g,mold=g%zwf)
       s%g=g%zwf ! Preserve trailing y padding, which CUDA intentionally never writes.
-      rc=finish_gpu(s%handle,up,ep,s%hx,s%g,np,fused)
+      if(s%resident)then
+        rc=retained_finish_gpu(s%handle,up,ep,s%hx,s%g,np,1_c_int)
+      else
+        rc=finish_gpu(s%handle,up,ep,s%hx,s%g,np,fused)
+      endif
     else
-      rc=finish_gpu(s%handle,up,ep,hx%zwf,g%zwf,np,fused)
+      if(s%resident)then
+        rc=retained_finish_gpu(s%handle,up,ep,hx%zwf,g%zwf,np,0_c_int)
+      else
+        rc=finish_gpu(s%handle,up,ep,hx%zwf,g%zwf,np,fused)
+      endif
     endif
-    close_rc=close_gpu(s%handle);s%handle=c_null_ptr
-    call require_success(rc,'finish');call require_success(close_rc,'close')
+    if(s%resident)then
+      call require_success(rc,'retained finish',s)
+      s%awaiting_accept=.true.
+    else
+      close_rc=close_gpu(s%handle);s%handle=c_null_ptr
+      call require_success(rc,'finish');call require_success(close_rc,'close')
+    endif
     allocate(s%norm(system%nspin,system%no,system%nk));s%norm=0.d0;v=0
     do ik=info%ik_s,info%ik_e
     do io=info%io_s,info%io_e
@@ -219,6 +301,68 @@ contains
     if(allocated(s%norm))deallocate(s%norm)
   end subroutine
 
+  subroutine cg_region_accept(s,system,info,bk,x)
+    type(cg_region_state),intent(inout) :: s
+    type(s_dft_system),intent(in) :: system
+    type(s_parallel_info),intent(in) :: info
+    real(8),intent(in) :: bk(:,:,:)
+    type(s_orbital),intent(in) :: x
+    real(c_double),allocatable :: mask(:)
+    complex(c_double_complex),allocatable :: xp(:,:,:,:,:,:,:),hp(:,:,:,:,:,:,:)
+    integer :: nv,v,ik,io,ispin
+    integer(c_int) :: rc
+    if(.not.s%resident)return
+    if(.not.s%awaiting_accept)call context_error(s,'CG missing resident finish')
+    nv=system%nspin*(info%io_e-info%io_s+1)*(info%ik_e-info%ik_s+1)
+    allocate(mask(nv));v=0
+    do ik=info%ik_s,info%ik_e
+    do io=info%io_s,info%io_e
+    do ispin=1,system%nspin
+      v=v+1;mask(v)=bk(ispin,io,ik)
+    enddo
+    enddo
+    enddo
+    rc=accept_gpu(s%handle,mask);call require_success(rc,'accepted x',s)
+    if(s%mode==1)then
+      ! Diagnostic copies are intentional in shadow mode, including padding bits.
+      allocate(xp,mold=x%zwf);allocate(hp,mold=x%zwf)
+      rc=snapshot_gpu(s%handle,xp,hp);call require_success(rc,'shadow x',s)
+      call exact('accepted x',reshape(xp,[size(xp)]),reshape(x%zwf,[size(x%zwf)]),.false.)
+    endif
+    s%awaiting_accept=.false.;s%next_iteration=s%next_iteration+1
+  end subroutine
+
+  subroutine cg_region_end(s,x,hx)
+    type(cg_region_state),intent(inout) :: s
+    type(s_orbital),intent(inout) :: x,hx
+    complex(c_double_complex),allocatable :: xp(:,:,:,:,:,:,:),hp(:,:,:,:,:,:,:)
+    integer(c_int) :: rc,close_rc
+    if(.not.c_associated(s%handle))return
+    if(.not.s%resident.or.s%awaiting_accept)call context_error(s,'CG incomplete resident iteration')
+    if(s%mode==1)then
+      allocate(xp,mold=x%zwf);allocate(hp,mold=hx%zwf)
+      rc=snapshot_gpu(s%handle,xp,hp)
+    else
+      rc=snapshot_gpu(s%handle,x%zwf,hx%zwf)
+    endif
+    close_rc=close_gpu(s%handle);s%handle=c_null_ptr;s%resident=.false.
+    call require_success(rc,'final x/Hx');call require_success(close_rc,'final close')
+    if(s%mode==1)then
+      call exact('final x',reshape(xp,[size(xp)]),reshape(x%zwf,[size(x%zwf)]),.false.)
+      call exact('final Hx',reshape(hp,[size(hp)]),reshape(hx%zwf,[size(hx%zwf)]),.false.)
+    endif
+    s%mode=0;s%next_iteration=0;s%layout=0;s%hvol_bits=0
+  end subroutine
+
+  subroutine context_error(s,message)
+    type(cg_region_state),intent(inout) :: s
+    character(*),intent(in) :: message
+    integer(c_int) :: rc
+    rc=close_gpu(s%handle);s%handle=c_null_ptr;s%resident=.false.
+    write(*,*) 'CG_CUDA CONTEXT_ERROR ',message,' cleanup=',rc
+    error stop 'CG resident contract failed; no stale CPU fallback'
+  end subroutine
+
   subroutine exact(label,a,b,check_finite)
     character(*),intent(in) :: label
     complex(8),intent(in) :: a(:),b(:)
@@ -239,10 +383,12 @@ contains
     endif
   end subroutine
 
-  subroutine require_success(rc,stage)
+  subroutine require_success(rc,stage,s)
     integer(c_int),intent(in) :: rc
     character(*),intent(in) :: stage
+    type(cg_region_state),intent(inout),optional :: s
     if(rc==0)return
+    if(present(s))call context_error(s,stage)
     write(*,*) 'CG_CUDA ERROR stage=',stage,' status=',rc
     error stop 'CG CUDA failure; no partial CPU recovery'
   end subroutine
