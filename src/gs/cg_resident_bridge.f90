@@ -508,9 +508,11 @@ contains
        .not.allocated(ppg%k2ilma).or..not.allocated(ppg%k2j))return
     natom=size(ppg%mps)
     if(ppg%nps<=0.or.ppg%nlma<=0.or.natom<=0.or.ppg%max_vi<=0)return
-    ! Direct borrowed sections below must have exactly these leading dimensions.
-    if(lbound(ppg%ia_tbl,1)/=1.or.size(ppg%ia_tbl)/=ppg%nlma.or. &
-       lbound(ppg%mps,1)/=1.or.lbound(ppg%rinv_uvu,1)/=1.or.size(ppg%rinv_uvu)/=ppg%nlma)return
+    ! init_ps reserves projector capacity; only the first nlma entries are active.
+    ! These rank-one arrays are copied by that active count, independent of capacity.
+    if(lbound(ppg%ia_tbl,1)/=1.or.size(ppg%ia_tbl)<ppg%nlma.or. &
+       lbound(ppg%mps,1)/=1.or.lbound(ppg%rinv_uvu,1)/=1.or.size(ppg%rinv_uvu)<ppg%nlma)return
+    ! Multidimensional borrowed sections still require the exact leading dimensions.
     if(any(lbound(ppg%jxyz)/=[1,1,1]).or.any(shape(ppg%jxyz)/=[3,ppg%nps,natom]))return
     if(lbound(ppg%zekr_uv,1)/=1.or.lbound(ppg%zekr_uv,2)/=1)return
     if(size(ppg%zekr_uv,1)/=ppg%nps.or.size(ppg%zekr_uv,2)/=ppg%nlma.or. &
