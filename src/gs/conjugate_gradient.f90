@@ -365,7 +365,7 @@ end subroutine gscg_rwf
 
 !===================================================================================================================================
 
-subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
+subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg,retain_workspace_outputs)
   use structures
 #ifdef SALMON_CG_CUDA
   use cg_resident_bridge, only: cg_region_state,cg_region_begin,cg_region_products_check, &
@@ -392,6 +392,9 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   type(s_orbital)               :: xk,hxk,gk
   type(s_sendrecv_grid)         :: srg
   type(s_cg)                    :: cg
+  ! .false. lets port mode of the whole-CG GPU path skip copying hxk, gk and the cg work arrays
+  ! back to the host. The caller must then overwrite them before reading them.
+  logical,optional,intent(in) :: retain_workspace_outputs
   !
   integer,parameter :: nd=4
   integer :: nspin,ik,io,ispin,ik_s,ik_e,io_s,io_e,is(3),ie(3),iy,iz
@@ -406,9 +409,15 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   complex(8) :: work(9),zphase,ztmp
 #ifdef SALMON_CG_CUDA
   type(cg_region_state) :: cuda_region
+  logical :: keep_workspaces
 #endif
 
   if(info%im_s/=1 .or. info%im_e/=1) stop "error: im/=1 @ gscg"
+
+#ifdef SALMON_CG_CUDA
+  keep_workspaces=.true.
+  if(present(retain_workspace_outputs))keep_workspaces=retain_workspace_outputs
+#endif
 
   call timer_begin(LOG_GSCG_PERIODIC_CALC)
   nspin = system%nspin
@@ -761,7 +770,8 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   end do ! icg
 #ifdef SALMON_CG_CUDA
   ! All three loop-head exits and the Ncg+1 limit reach this single flush.
-  call cg_epoch_end(cuda_region,xk,hxk,gk,cg%pre_gk,cg%pk,cg%hpk)
+  call cg_epoch_end(cuda_region,xk,hxk,gk,cg%pre_gk,cg%pk,cg%hpk, &
+                    retain_workspace_outputs=keep_workspaces)
   call cg_region_end(cuda_region,xk,hxk)
 #endif
 

@@ -708,21 +708,30 @@ contains
     endif
   end subroutine
 
-  subroutine cg_epoch_end(s,x,hx,g,pre_g,p,hp)
+  subroutine cg_epoch_end(s,x,hx,g,pre_g,p,hp,retain_workspace_outputs)
     type(cg_region_state),intent(inout) :: s
     type(s_orbital),intent(inout) :: x,hx,g,pre_g,p,hp
+    logical,optional,intent(in) :: retain_workspace_outputs
     integer(c_int) :: rc
+    logical :: keep_workspaces
     if(.not.s%epoch)return
     if(s%awaiting_accept)call context_error(s,'epoch exit before acceptance')
-    call epoch_output(s,0,x,'final epoch x')
-    call epoch_output(s,1,hx,'final epoch Hx')
-    call epoch_output(s,2,g,'final epoch g')
-    ! The original loop copies pre_g=g BEFORE every exit test, including Ncg=0.
-    call epoch_output(s,2,pre_g,'final epoch pre_g')
-    if(s%epoch_iterations>0)then
-      call epoch_output(s,3,p,'final epoch p')
-      call epoch_output(s,4,hp,'final epoch Hp')
+    keep_workspaces=.true.
+    if(s%mode==2)then
+      if(present(retain_workspace_outputs))keep_workspaces=retain_workspace_outputs
     endif
+    call epoch_output(s,0,x,'final epoch x')
+    if(keep_workspaces)then
+      call epoch_output(s,1,hx,'final epoch Hx')
+      call epoch_output(s,2,g,'final epoch g')
+      ! The original loop copies pre_g=g BEFORE every exit test, including Ncg=0.
+      call epoch_output(s,2,pre_g,'final epoch pre_g')
+      if(s%epoch_iterations>0)then
+        call epoch_output(s,3,p,'final epoch p')
+        call epoch_output(s,4,hp,'final epoch Hp')
+      endif
+    endif
+    write(*,*) 'CG_CUDA EPOCH_WORKSPACE_OUTPUTS retained=',keep_workspaces
     rc=close_gpu(s%handle);s%handle=c_null_ptr;call require_success(rc,'epoch close')
     write(*,*) 'CG_CUDA EPOCH_END iterations=',s%epoch_iterations,' mode=',s%mode
     s%mode=0;s%epoch=.false.;s%resident=.false.;s%next_iteration=0;s%epoch_iterations=0

@@ -20,7 +20,7 @@ module scf_iteration_sub
 contains
 
 subroutine solve_orbitals(mg,system,info,stencil,spsi,shpsi,sttpsi,srg,cg,ppg,vlocal,  &
-            &   miter,nscf_init_no_diagonal)
+            &   miter,nscf_init_no_diagonal,retain_workspace_outputs)
   use salmon_global, only: yn_subspace_diagonalization,ncg,ncg_init
   use structures
   use timer
@@ -39,8 +39,14 @@ subroutine solve_orbitals(mg,system,info,stencil,spsi,shpsi,sttpsi,srg,cg,ppg,vl
   type(s_scalar),         intent(in)    :: vlocal(system%nspin)
   integer,                intent(in)    :: miter
   integer,                intent(in)    :: nscf_init_no_diagonal
+  logical,optional,       intent(in)    :: retain_workspace_outputs
   !
   integer :: nncg
+  logical :: keep_workspaces
+
+  ! Public callers retain all CG outputs unless they establish a narrower lifetime.
+  keep_workspaces=.true.
+  if(present(retain_workspace_outputs))keep_workspaces=retain_workspace_outputs
 
   if(miter==1) then
     nncg = ncg_init
@@ -62,7 +68,8 @@ subroutine solve_orbitals(mg,system,info,stencil,spsi,shpsi,sttpsi,srg,cg,ppg,vl
   if(system%if_real_orbital) then
     call gscg_rwf(nncg,mg,system,info,stencil,ppg,vlocal,srg,spsi,shpsi,sttpsi,cg)
   else
-    call gscg_zwf(nncg,mg,system,info,stencil,ppg,vlocal,srg,spsi,shpsi,sttpsi,cg)
+    call gscg_zwf(nncg,mg,system,info,stencil,ppg,vlocal,srg,spsi,shpsi,sttpsi,cg, &
+                 retain_workspace_outputs=keep_workspaces)
   end if
   call timer_end(LOG_CALC_MINIMIZATION)
 
