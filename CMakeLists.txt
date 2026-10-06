@@ -27,6 +27,10 @@ project(SALMON
 # Optional CUDA kernels for parts of the ground-state solver in CPU (non-OpenACC) builds.
 # They keep the operation order of the CPU code they replace. All are OFF by default.
 option(SALMON_CG_CUDA "Offload the complex CG solver gscg_zwf to CUDA in CPU builds (see SALMON_CG_CUDA_MODE)" OFF)
+option(SALMON_CG_ORDERED_NONLOCAL "Also apply Hpsi of SALMON_CG_CUDA on the GPU (periodic 16^3 grids)" OFF)
+if(SALMON_CG_ORDERED_NONLOCAL AND NOT SALMON_CG_CUDA)
+  message(FATAL_ERROR "SALMON_CG_ORDERED_NONLOCAL requires SALMON_CG_CUDA")
+endif()
 set(SALMON_CG_CUDA_ARCH "" CACHE STRING "Explicit allocated CUDA architecture, e.g. 90")
 if(SALMON_CG_CUDA)
   if(CMAKE_VERSION VERSION_LESS 3.18)

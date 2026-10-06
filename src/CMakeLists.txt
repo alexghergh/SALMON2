@@ -38,6 +38,12 @@ endif()
 
 if(SALMON_CG_CUDA)
   add_library(salmon_cg_cuda STATIC gs/cg_resident.cu)
+  if(SALMON_CG_ORDERED_NONLOCAL)
+    target_sources(salmon_cg_cuda PRIVATE gs/cg_nonlocal_ordered.cu gs/cg_stencil_ordered.cu)
+    target_compile_definitions(salmon_cg_cuda PRIVATE SALMON_CG_ORDERED_NONLOCAL)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/atom/pp/prep_pp.f90
+                 APPEND PROPERTY COMPILE_DEFINITIONS SALMON_CG_ORDERED_NONLOCAL)
+  endif()
   set_target_properties(salmon_cg_cuda PROPERTIES
     CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
     CUDA_ARCHITECTURES "${SALMON_CG_CUDA_ARCH}"

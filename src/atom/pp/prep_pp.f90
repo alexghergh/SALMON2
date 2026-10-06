@@ -179,6 +179,10 @@ subroutine init_ps(lg,mg,system,info,fg,poisson,pp,ppg,Vpsl)
                           info%im_s:info%im_e))
     call init_uvpsi_blocking(ppg,mg)
   end if
+#elif defined(SALMON_CG_ORDERED_NONLOCAL)
+  ! The CUDA Hpsi of SALMON_CG_ORDERED_NONLOCAL uses the same inverse projector map.
+  ! Only the map is built here; no OpenACC code or host uVpsibox is enabled.
+  if(.not.info%if_divide_rspace)call init_uvpsi_blocking(ppg,mg)
 #endif
 
   if(iperiodic==3) then
@@ -545,6 +549,14 @@ SUBROUTINE dealloc_init_ps(ppg)
   if (allocated(ppg%ilocal_nlma2ilma)) deallocate(ppg%ilocal_nlma2ilma)
   if (allocated(ppg%ilocal_nlma2ia))   deallocate(ppg%ilocal_nlma2ia)
   if (allocated(ppg%uVpsibox))       deallocate(ppg%uVpsibox)
+#ifdef SALMON_CG_ORDERED_NONLOCAL
+  ! These inverse maps have the same geometry lifetime as jxyz above.
+  if (allocated(ppg%v2j))    deallocate(ppg%v2j)
+  if (allocated(ppg%v2nlma)) deallocate(ppg%v2nlma)
+  if (allocated(ppg%k2ilma)) deallocate(ppg%k2ilma)
+  if (allocated(ppg%k2j))    deallocate(ppg%k2j)
+  ppg%max_vi=0
+#endif
   
   return
 END SUBROUTINE dealloc_init_ps
