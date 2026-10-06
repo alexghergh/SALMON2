@@ -369,7 +369,12 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   use structures
 #ifdef SALMON_CG_CUDA
   use cg_resident_bridge, only: cg_region_state,cg_region_begin,cg_region_products_check, &
-       cg_region_finish,cg_region_update_check,cg_region_report,cg_region_accept,cg_region_end
+       cg_region_finish,cg_region_update_check,cg_region_report,cg_region_accept,cg_region_end, &
+       cg_epoch_begin,cg_epoch_hpsi,cg_epoch_initial,cg_epoch_initial_check,cg_epoch_norm,cg_epoch_norm_check, &
+       cg_epoch_direction,cg_epoch_field_check,cg_epoch_end,cg_epoch_energy_check
+  use pseudo_pt_plusU_sub, only: PLUS_U_ON
+  use code_optimization, only: optimized_stencil_is_callable,stencil_is_parallelized_by_omp
+  use salmon_global, only: yn_periodic,yn_jm,absorbing_boundary
 #endif
   use timer
   use hamiltonian, only: hpsi
@@ -434,14 +439,38 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
 
   E1 = 1.0d10
 
+#ifdef SALMON_CG_CUDA
+  ! The whole-CG GPU mode covers only the plain periodic Hpsi without preconditioning (below).
+  ! All unsupported routes return before any host field or CPU branch is changed.
+  call cg_epoch_begin(cuda_region,mg,system,info,stencil,ppg,vlocal,xk,cg%pk,hxk,cg%hpk,gk,cg%pre_gk, &
+       yn_preconditioning=='n'.and.yn_spinorbit=='n'.and.yn_periodic=='y'.and.yn_jm=='n'.and. &
+       absorbing_boundary/='z'.and..not.PLUS_U_ON.and..not.system%xc_payload%use_tau_operator.and. &
+       .not.optimized_stencil_is_callable.and..not.stencil_is_parallelized_by_omp)
+#endif
+
   call timer_end(LOG_GSCG_PERIODIC_CALC)
 
   call timer_begin(LOG_GSCG_PERIODIC_HPSI)
+#ifdef SALMON_CG_CUDA
+  call cg_epoch_hpsi(cuda_region,.true.)
+  if(.not.(cuda_region%epoch.and.cuda_region%mode==2))then
+#endif
   call hpsi(xk,hxk,info,mg,vlocal,system,stencil,srg,ppg)
+#ifdef SALMON_CG_CUDA
+  endif
+  call cg_epoch_field_check(cuda_region,1,hxk,'initial Hpsi')
+#endif
   call timer_end(LOG_GSCG_PERIODIC_HPSI)
 
   call timer_begin(LOG_GSCG_PERIODIC_CALC)
+#ifdef SALMON_CG_CUDA
+  call cg_epoch_initial(cuda_region,system,info,E,zb)
+  if(.not.(cuda_region%epoch.and.cuda_region%mode==2))then
+#endif
   call inner_product(mg,system,info,xk,hxk,zb)
+#ifdef SALMON_CG_CUDA
+  call cg_epoch_energy_check(cuda_region,zb)
+#endif
   E = dble(zb)
  
 #ifdef USE_OPENACC
@@ -463,10 +492,18 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   end do
 
   call inner_product(mg,system,info,gk,gk,zb)
+#ifdef SALMON_CG_CUDA
+  endif
+  call cg_epoch_initial_check(cuda_region,E,gk,zb)
+#endif
   rb = dble(zb)
 
   do icg=1,Ncg+1
 
+#ifdef SALMON_CG_CUDA
+    ! On the unpreconditioned device route pre_g aliases g until the final flush.
+    if(.not.(cuda_region%epoch.and.cuda_region%mode==2))then
+#endif
 #ifdef USE_OPENACC
 !$acc parallel loop private(ik,io,ispin,iz,iy) collapse(5)
 #else
@@ -484,6 +521,9 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
     end do
     end do
     
+#ifdef SALMON_CG_CUDA
+    endif
+#endif
     res = rb
 
 ! --- Convergence check ---
@@ -502,11 +542,22 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
 
 ! ---
 
+#ifdef SALMON_CG_CUDA
+    call cg_epoch_norm(cuda_region,system,info,zb)
+    if(.not.(cuda_region%epoch.and.cuda_region%mode==2))then
+#endif
     call inner_product(mg,system,info,cg%pre_gk,gk,zb)
+#ifdef SALMON_CG_CUDA
+    endif
+    call cg_epoch_norm_check(cuda_region,zb)
+#endif
     rb = dble(zb)
 
     if ( icg==1 ) then
 
+#ifdef SALMON_CG_CUDA
+      if(.not.(cuda_region%epoch.and.cuda_region%mode==2))then
+#endif
 #ifdef USE_OPENACC
 !$acc parallel loop private(ik,io,ispin,iz,iy) collapse(5)
 #else
@@ -524,9 +575,15 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
       end do
       end do
 
+#ifdef SALMON_CG_CUDA
+      endif
+#endif
     else
 
       bk = rb/gkgk
+#ifdef SALMON_CG_CUDA
+      if(.not.(cuda_region%epoch.and.cuda_region%mode==2))then
+#endif
 
 #ifdef USE_OPENACC
 !$acc parallel loop private(ik,io,ispin,iz,iy) collapse(5)
@@ -547,13 +604,27 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
       end do
       end do
       
+#ifdef SALMON_CG_CUDA
+      endif
+#endif
     end if
 
+#ifdef SALMON_CG_CUDA
+    call cg_epoch_direction(cuda_region,system,info,icg,bk,cg%pk)
+#endif
     gkgk = rb
     call timer_end(LOG_GSCG_PERIODIC_CALC)
 
     call timer_begin(LOG_GSCG_PERIODIC_HPSI)
+#ifdef SALMON_CG_CUDA
+    call cg_epoch_hpsi(cuda_region,.false.)
+    if(.not.(cuda_region%epoch.and.cuda_region%mode==2))then
+#endif
     call hpsi(cg%pk,cg%hpk,info,mg,vlocal,system,stencil,srg,ppg)
+#ifdef SALMON_CG_CUDA
+    endif
+    call cg_epoch_field_check(cuda_region,4,cg%hpk,'direction Hpsi')
+#endif
     call timer_end(LOG_GSCG_PERIODIC_HPSI)
 
     call timer_begin(LOG_GSCG_PERIODIC_CALC)
@@ -690,6 +761,7 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg)
   end do ! icg
 #ifdef SALMON_CG_CUDA
   ! All three loop-head exits and the Ncg+1 limit reach this single flush.
+  call cg_epoch_end(cuda_region,xk,hxk,gk,cg%pre_gk,cg%pk,cg%hpk)
   call cg_region_end(cuda_region,xk,hxk)
 #endif
 
