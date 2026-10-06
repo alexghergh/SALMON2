@@ -904,6 +904,10 @@ contains
       use pack_unpack, only: copy_data
       use timer
       use communication, only: comm_bcast, comm_summation
+#ifdef SALMON_REAL_GRAM_ORDERED
+      use real_gram_context, only: real_gram_workspace,real_gram_requested,real_gram_supported, &
+        real_gram_begin,real_gram_overlap,real_gram_update,real_gram_end
+#endif
       implicit none
       type(s_dft_system),   intent(in)    :: sys
       type(s_rgrid),        intent(in)    :: rg
@@ -927,8 +931,20 @@ contains
       real(8) :: wf_block_send(rg%is(1):rg%ie(1), rg%is(2):rg%ie(2), rg%is(3):rg%ie(3), wfi%numo_max)
       real(8) :: umat(wfi%numo_max,wfi%numo), umat_tmp(wfi%numo_max,wfi%numo)
       real(8) :: DDOT
+#ifdef SALMON_REAL_GRAM_ORDERED
+      type(real_gram_workspace) :: ordered_pair
+      logical :: ordered_real
+#endif
 
       nsize_rg = (rg%ie(1)-rg%is(1)+1)*(rg%ie(2)-rg%is(2)+1)*(rg%ie(3)-rg%is(3)+1)
+
+#ifdef SALMON_REAL_GRAM_ORDERED
+      ordered_real=real_gram_requested()
+      ordered_real=ordered_real.and.real_gram_supported(nsize_rg,wfi%numo_max,wfi%numo,sys%hvol).and. &
+        all(rg%ie-rg%is+1==[22,22,44]).and.all(wfi%nprgrid==[4,4,2]).and. &
+        wfi%if_divide_orbit.and.wfi%if_divide_rspace.and.wfi%nporbital==2.and.wfi%isize_r==32.and. &
+        wfi%npk==1.and.wfi%ik_s==1.and.wfi%ik_e==1.and.wfi%im_s==1.and.wfi%im_e==1.and.sys%nspin==1
+#endif
 
       do im = wfi%im_s, wfi%im_e
       do ik = wfi%ik_s, wfi%ik_e
@@ -1147,10 +1163,21 @@ contains
 
             umat_tmp=0.d0
             if( wfi%id_o > m )then
+#ifdef SALMON_REAL_GRAM_ORDERED
+              if(ordered_real) then
+                call real_gram_begin(ordered_pair)
+                write(*,'(a,i0,a,i0,a,i0,a,i0)') 'REAL_GRAM_ORDERED_BEGIN rank=',wfi%id_rko, &
+                  ' group=',m,' points=',nsize_rg,' states=',wfi%numo
+                call real_gram_overlap(ordered_pair,wf_block_send,wf_block,sys%hvol,umat_tmp)
+              else
+#endif
               call dgemm(TRANSA, TRANSB, wfi%numo_max, wfi%numo, nsize_rg,  &
                 &      sys%hvol, wf_block_send(:,:,:,1), nsize_rg,  &
                 &                wf_block(:,:,:,1), nsize_rg,  &
                 &          zero, umat_tmp, wfi%numo_max )
+#ifdef SALMON_REAL_GRAM_ORDERED
+              end if
+#endif
 
               if(wfi%if_divide_rspace) then
                 call comm_summation(umat_tmp, umat, wfi%numo_max*wfi%numo, wfi%icomm_r)
@@ -1158,10 +1185,20 @@ contains
                 umat = umat_tmp
               end if
 
+#ifdef SALMON_REAL_GRAM_ORDERED
+              if(ordered_real) then
+                call real_gram_update(ordered_pair,umat,wf_block)
+                call real_gram_end(ordered_pair)
+                write(*,'(a,i0,a,i0)') 'REAL_GRAM_ORDERED_END rank=',wfi%id_rko,' group=',m
+              else
+#endif
               call dgemm(TRANSB, TRANSB, nsize_rg, wfi%numo, wfi%numo_max,  &
                 &         - one, wf_block_send(:,:,:,1), nsize_rg,  &
                 &                umat, wfi%numo_max,  &
                 &           one, wf_block(:,:,:,1), nsize_rg)
+#ifdef SALMON_REAL_GRAM_ORDERED
+              end if
+#endif
             end if
           end if ! wfi%if_divide_orbit
 

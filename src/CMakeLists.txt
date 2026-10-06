@@ -26,6 +26,18 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/analysis)
 add_executable(${TARGET_NAME} main.f90 ${SALMON_SOURCES})
 target_link_libraries(${TARGET_NAME} ${EXTERNAL_LIBS})
 
+if(SALMON_REAL_GRAM_ORDERED)
+  add_library(salmon_real_gram_cuda STATIC common/real_gram_ordered.cu common/real_gram_context.cu)
+  set_target_properties(salmon_real_gram_cuda PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${SALMON_REAL_GRAM_CUDA_ARCH}"
+    CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
+  target_compile_options(salmon_real_gram_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+  set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/gs/gram_schmidt_orth.f90
+               APPEND PROPERTY COMPILE_DEFINITIONS SALMON_REAL_GRAM_ORDERED)
+  target_link_libraries(${TARGET_NAME} salmon_real_gram_cuda CUDA::cudart stdc++)
+endif()
+
 if(USE_ORDERED_SMALL_GRAM)
   # Keep CUDA Fortran syntax and its dispatch definition local to these sources.
   set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/common/small_gram_ordered_cuda.f90
