@@ -111,7 +111,8 @@ if(nscf_init_mix_zero.gt.1)then
       call solve_orbitals(mg,system,info,stencil,spsi,shpsi,sttpsi,srg,cg,ppg,v_local,iter, &
                           nscf_init_no_diagonal,retain_workspace_outputs=.false.)
       call timer_begin(LOG_CALC_TOTAL_ENERGY)
-      call calc_eigen_energy_ordered(energy,spsi,shpsi,sttpsi,system,info,mg,V_local,stencil,srg,ppg)
+      call calc_eigen_energy_ordered(energy,spsi,shpsi,sttpsi,system,info,mg,V_local,stencil,srg,ppg, &
+       retain_workspace_outputs=(yn_dc/='n'.or.theory/='dft'))
       select case(iperiodic)
       case(0); call calc_Total_Energy_isolated(system,info,lg,mg,pp,ppg,fg,poisson,rho_s,Vh,Vxc,rion_update,energy)
       case(3); call calc_Total_Energy_periodic(mg,ewald,system,info,pp,ppg,fg,poisson,rion_update,energy)
@@ -219,7 +220,8 @@ DFT_Iteration : do iter=Miter+1,nscf
    if(yn_spinorbit=='y') then
      call calc_magnetization(system,mg,info,magnetization)
    end if
-   call calc_eigen_energy_ordered(energy,spsi,shpsi,sttpsi,system,info,mg,V_local,stencil,srg,ppg)
+   call calc_eigen_energy_ordered(energy,spsi,shpsi,sttpsi,system,info,mg,V_local,stencil,srg,ppg, &
+       retain_workspace_outputs=(yn_dc/='n'.or.theory/='dft'))
    call get_band_gap(system,energy,ene_gap)
    if(calc_mode/='DFT_BAND' .and. yn_dc=='n')then
       select case(iperiodic)

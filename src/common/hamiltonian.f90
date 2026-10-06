@@ -57,7 +57,27 @@ SUBROUTINE hpsi_ordered(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
   call hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,allow_cuda=.true.)
 end subroutine hpsi_ordered
 
-SUBROUTINE hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,allow_cuda)
+! Hpsi for calc_eigen_energy when htpsi/ttpsi are not needed afterwards: with SALMON_HPSI_ENERGY
+! the GPU returns only the three energy sums per orbital. The hpsi entry is unchanged.
+SUBROUTINE hpsi_energy_ordered(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,energy_sums,captured)
+  use structures
+  implicit none
+  type(s_dft_system),intent(in) :: system
+  type(s_parallel_info),intent(in) :: info
+  type(s_rgrid),intent(in) :: mg
+  type(s_scalar),intent(in) :: V_local(system%Nspin)
+  type(s_stencil),intent(in) :: stencil
+  type(s_sendrecv_grid),intent(inout) :: srg
+  type(s_pp_grid),intent(in) :: ppg
+  type(s_orbital) :: tpsi,htpsi
+  type(s_orbital),optional :: ttpsi
+  real(8),intent(out) :: energy_sums(:,:,:)
+  logical,intent(out) :: captured
+  call hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,allow_cuda=.true., &
+                 energy_sums=energy_sums,captured=captured)
+end subroutine hpsi_energy_ordered
+
+SUBROUTINE hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,allow_cuda,energy_sums,captured)
   use structures
   use stencil_sub
   use nonlocal_potential
@@ -89,6 +109,8 @@ SUBROUTINE hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,all
   type(s_orbital)            :: tpsi,htpsi
   type(s_orbital),optional   :: ttpsi
   logical,intent(in) :: allow_cuda
+  real(8),optional,intent(out) :: energy_sums(:,:,:)
+  logical,optional,intent(out) :: captured
 #ifdef SALMON_SHARED_HPSI
   type(hpsi_cuda_state) :: cuda_hpsi
 #endif
@@ -100,6 +122,7 @@ SUBROUTINE hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,all
   !real(8) :: tmp,tmp1
   real(8) :: kAc0(3)
 
+  if(present(captured))captured=.false.
   call nvtxStartRange('hpsi', __LINE__)
   call timer_begin(LOG_UHPSI_ALL)
 
@@ -189,7 +212,16 @@ SUBROUTINE hpsi_body(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,all
       call hpsi_cuda_begin(cuda_hpsi,mg,system,info,stencil,ppg,V_local,tpsi,htpsi, &
            yn_spinorbit=='n'.and.yn_periodic=='y'.and.yn_jm=='n'.and. &
            absorbing_boundary/='z'.and..not.PLUS_U_ON.and..not.system%xc_payload%use_tau_operator.and. &
-           .not.optimized_stencil_is_callable.and..not.stencil_is_parallelized_by_omp,tx=ttpsi)
+           .not.optimized_stencil_is_callable.and..not.stencil_is_parallelized_by_omp,tx=ttpsi, &
+           energy_sums=energy_sums,captured=captured)
+      if(present(captured))then
+        if(captured)then
+          call timer_end(LOG_UHPSI_STENCIL)
+          call timer_end(LOG_UHPSI_ALL)
+          call nvtxEndRange()
+          return
+        endif
+      endif
     endif
     if(.not.hpsi_cuda_active(cuda_hpsi))then
 #endif

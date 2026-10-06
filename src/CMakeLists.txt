@@ -50,7 +50,7 @@ if(SALMON_CG_CUDA)
                  APPEND PROPERTY COMPILE_DEFINITIONS SALMON_CG_ORDERED_NONLOCAL)
   endif()
   if(SALMON_SHARED_HPSI)
-    target_sources(salmon_cg_cuda PRIVATE common/hpsi_cuda_call.cu)
+    target_sources(salmon_cg_cuda PRIVATE common/hpsi_cuda_call.cu common/hpsi_energy_ordered.cu)
     set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/common/hamiltonian.f90
                  APPEND PROPERTY COMPILE_DEFINITIONS SALMON_SHARED_HPSI)
   endif()

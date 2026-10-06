@@ -537,7 +537,8 @@ CONTAINS
     call calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg,allow_cuda=.false.)
   end subroutine calc_eigen_energy
 
-  subroutine calc_eigen_energy_ordered(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg)
+  subroutine calc_eigen_energy_ordered(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg, &
+                                       retain_workspace_outputs)
     use structures
     implicit none
     type(s_dft_energy)                     :: energy
@@ -549,13 +550,19 @@ CONTAINS
     type(s_stencil)         ,intent(in)    :: stencil
     type(s_sendrecv_grid)   ,intent(inout) :: srg
     type(s_pp_grid)         ,intent(in)    :: ppg
-    call calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg,allow_cuda=.true.)
+    logical,optional,intent(in) :: retain_workspace_outputs
+    logical :: retain
+    retain=.true.
+    if(present(retain_workspace_outputs))retain=retain_workspace_outputs
+    call calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg, &
+                                allow_cuda=.true.,retain_workspace_outputs=retain)
   end subroutine calc_eigen_energy_ordered
 
-  Subroutine calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg,allow_cuda)
+  Subroutine calc_eigen_energy_body(energy,tpsi,htpsi,ttpsi,system,info,mg,V_local,stencil,srg,ppg,allow_cuda, &
+                                     retain_workspace_outputs)
     use structures
     use communication, only: comm_summation
-    use hamiltonian, only: hpsi,hpsi_ordered
+    use hamiltonian, only: hpsi,hpsi_ordered,hpsi_energy_ordered
     use pseudo_pt_so_sub, only: pseudo_so
     use salmon_global, only: yn_spinorbit
     use timer
@@ -571,10 +578,15 @@ CONTAINS
     type(s_sendrecv_grid)   ,intent(inout) :: srg
     type(s_pp_grid)         ,intent(in)    :: ppg
     logical,intent(in) :: allow_cuda
+    logical,optional,intent(in) :: retain_workspace_outputs
+    logical :: captured,retain
+    real(8),allocatable :: energy_sums(:,:,:)
     !
     integer :: ik,io,ispin,im,nk,no,is(3),ie(3),Nspin
     real(8) :: E_tmp,E_local(2),E_sum(2)
     real(8),allocatable :: wrk1(:,:,:),wrk2(:,:,:)
+    captured=.false.;retain=.true.
+    if(present(retain_workspace_outputs))retain=retain_workspace_outputs
     call nvtxStartRange('calc_eigen_energy', __LINE__)
     call timer_begin(LOG_EIGEN_ENERGY_CALC)
     if(info%im_s/=1 .or. info%im_e/=1) stop "error: calc_eigen_energy"
@@ -590,11 +602,20 @@ CONTAINS
     call timer_end(LOG_EIGEN_ENERGY_CALC)
 
     call timer_begin(LOG_EIGEN_ENERGY_HPSI)
+#ifndef USE_OPENACC
+    if(allow_cuda.and..not.retain)then
+      allocate(energy_sums(3,info%io_s:info%io_e,info%ik_s:info%ik_e))
+      call hpsi_energy_ordered(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi,energy_sums,captured)
+    else
+#endif
     if(allow_cuda)then
       call hpsi_ordered(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
     else
     call hpsi(tpsi,htpsi,info,mg,V_local,system,stencil,srg,ppg,ttpsi)
     endif
+#ifndef USE_OPENACC
+    endif
+#endif
     call timer_end(LOG_EIGEN_ENERGY_HPSI)
 
     if(allocated(tpsi%rwf)) then
@@ -705,13 +726,21 @@ CONTAINS
 #else
 !$omp parallel do collapse(3) default(none) &
 !$omp          private(ik,io,ispin) &
-!$omp          shared(info,wrk1,tpsi,htpsi,system,is,ie,im,nspin)
+!$omp          shared(info,wrk1,tpsi,htpsi,system,is,ie,im,nspin,captured,energy_sums)
 #endif
       do ik=info%ik_s,info%ik_e
       do io=info%io_s,info%io_e
       do ispin=1,Nspin
+#ifndef USE_OPENACC
+        if(captured)then
+          wrk1(ispin,io,ik)=energy_sums(1,io,ik)*system%Hvol
+        else
+#endif
         wrk1(ispin,io,ik) = sum( conjg( tpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im) ) &
                                * htpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im) ) * system%Hvol
+#ifndef USE_OPENACC
+        endif
+#endif
       end do
       end do
       end do
@@ -741,14 +770,22 @@ CONTAINS
 !$omp parallel do collapse(3) default(none) &
 !$omp          reduction(+:E_tmp) &
 !$omp          private(ispin,ik,io) &
-!$omp          shared(Nspin,info,tpsi,ttpsi,system,is,ie,im)
+!$omp          shared(Nspin,info,tpsi,ttpsi,system,is,ie,im,captured,energy_sums)
 #endif
       do ispin=1,Nspin
         do ik=info%ik_s,info%ik_e
         do io=info%io_s,info%io_e
+#ifndef USE_OPENACC
+          if(captured)then
+            E_tmp=E_tmp+system%rocc(io,ik,ispin)*system%wtk(ik)*energy_sums(2,io,ik)*system%Hvol
+          else
+#endif
           E_tmp = E_tmp + system%rocc(io,ik,ispin)*system%wtk(ik) &
                       * sum( conjg( tpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im) ) &
                                  * ttpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im) ) * system%Hvol
+#ifndef USE_OPENACC
+          endif
+#endif
         end do
         end do
       end do
@@ -772,7 +809,7 @@ CONTAINS
 !$omp parallel do collapse(3) default(none) &
 !$omp          reduction(+:E_tmp) &
 !$omp          private(ispin,ik,io) &
-!$omp          shared(Nspin,info,tpsi,ttpsi,system,is,ie,im)
+!$omp          shared(Nspin,info,tpsi,ttpsi,system,is,ie,im,captured,energy_sums)
 #endif
       do ispin=1,Nspin
         do ik=info%ik_s,info%ik_e
@@ -795,17 +832,25 @@ CONTAINS
 !$omp parallel do collapse(3) default(none) &
 !$omp          reduction(+:E_tmp) &
 !$omp          private(ispin,ik,io) &
-!$omp          shared(Nspin,info,tpsi,htpsi,ttpsi,system,is,ie,im,V_local)
+!$omp          shared(Nspin,info,tpsi,htpsi,ttpsi,system,is,ie,im,V_local,captured,energy_sums)
 #endif
         do ispin=1,Nspin
           do ik=info%ik_s,info%ik_e
           do io=info%io_s,info%io_e
+#ifndef USE_OPENACC
+            if(captured)then
+              E_tmp=E_tmp+system%rocc(io,ik,ispin)*system%wtk(ik)*system%Hvol*energy_sums(3,io,ik)
+            else
+#endif
             E_tmp = E_tmp + system%rocc(io,ik,ispin)*system%wtk(ik) * system%hvol &
               * sum( conjg(tpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im)) &
                 * (htpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im) &
                   - (ttpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im) &
                      + V_local(ispin)%f(is(1):ie(1),is(2):ie(2),is(3):ie(3)) &
                      * tpsi%zwf(is(1):ie(1),is(2):ie(2),is(3):ie(3),ispin,io,ik,im) ) ) )
+#ifndef USE_OPENACC
+            endif
+#endif
           end do
           end do
         end do
@@ -831,6 +876,7 @@ CONTAINS
       energy%E_ion_nloc = energy%E_ion_nloc - system%xc_payload%e_tau
     end if
 
+    if(allocated(energy_sums))deallocate(energy_sums)
     deallocate(wrk1,wrk2)
     call nvtxEndRange
     return
