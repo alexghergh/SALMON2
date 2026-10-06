@@ -243,6 +243,10 @@ end subroutine ssdg_rwf
 
 subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   use salmon_global, only: yn_scalapack
+#ifdef SALMON_SUBSPACE_ORDERED
+  use salmon_global, only: yn_spinorbit
+  use subspace_ordered_context
+#endif
   use structures
   use communication, only: comm_summation,comm_bcast
   use timer
@@ -269,10 +273,37 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   complex(8) :: hmat_block(info%numo_max, info%numo)
   complex(8) :: hmat_block_tmp(info%numo_max, info%numo)
   real(8) :: eval(system%no)
+#ifdef SALMON_SUBSPACE_ORDERED
+  type(subspace_workspace) :: ordered_workspace
+  logical :: ordered
+#endif
 
 #ifdef USE_OPENACC
   call ssdg_zwf_cblas_gpu(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   return
+#endif
+
+#ifdef SALMON_SUBSPACE_ORDERED
+  ! The CUDA ZGEMMs handle only 80 complex orbitals on an undivided 16^3 grid. Other layouts
+  ! keep the CPU path; decide before any device allocation or change to host data.
+  ordered=.false.
+  if(subspace_requested()) then
+    if(.not.system%if_real_orbital.and.system%nspin==1.and.system%no==80.and. &
+       yn_spinorbit=='n'.and.yn_scalapack=='n'.and.all(mg%ie-mg%is+1==16).and. &
+       .not.info%if_divide_orbit.and..not.info%if_divide_rspace.and. &
+       info%nporbital==1.and.info%id_o==0.and.info%numo==80.and.info%numo_max==80.and. &
+       info%io_s==1.and.info%io_e==80.and.info%im_s==1.and.info%im_e==1.and. &
+       info%numk>0.and.info%ik_s>=1.and.info%ik_e<=system%nk.and. &
+       info%ik_e-info%ik_s+1==info%numk) then
+      if(allocated(info%numo_all).and.allocated(info%io_s_all).and.allocated(info%io_e_all)) then
+        if(lbound(info%numo_all,1)==0.and.ubound(info%numo_all,1)==0.and. &
+           lbound(info%io_s_all,1)==0.and.ubound(info%io_s_all,1)==0.and. &
+           lbound(info%io_e_all,1)==0.and.ubound(info%io_e_all,1)==0) then
+          ordered=info%numo_all(0)==80.and.info%io_s_all(0)==1.and.info%io_e_all(0)==80
+        endif
+      endif
+    endif
+  endif
 #endif
 
   call timer_begin(LOG_SSDG_PERIODIC_HPSI)
@@ -280,6 +311,14 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   call timer_end(LOG_SSDG_PERIODIC_HPSI)
 
   nsize_rg = (mg%ie(1)-mg%is(1)+1)*(mg%ie(2)-mg%is(2)+1)*(mg%ie(3)-mg%is(3)+1)
+
+#ifdef SALMON_SUBSPACE_ORDERED
+  if(ordered) then
+    call timer_begin(LOG_SSDG_PERIODIC_CALC)
+    call subspace_begin(ordered_workspace)
+    call timer_end(LOG_SSDG_PERIODIC_CALC)
+  endif
+#endif
 
   do im = info%im_s, info%im_e
   do ik = info%ik_s, info%ik_e
@@ -314,10 +353,18 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
 
       call timer_begin(LOG_SSDG_PERIODIC_CALC)
       hmat_block_tmp = 0d0
+#ifdef SALMON_SUBSPACE_ORDERED
+      if(ordered) then
+        call subspace_overlap(ordered_workspace,wf_block_send,wf2_block,system%hvol,hmat_block_tmp)
+      else
+#endif
       call zgemm('C', 'N', info%numo_all(m), info%numo, nsize_rg,  &
         &   one*system%hvol, wf_block_send(:,:,:,1:info%numo_all(m)), nsize_rg,  &
         &                       wf2_block(:,:,:,1), nsize_rg,  &
         &                  zero, hmat_block_tmp(1:info%numo_all(m),1:info%numo), info%numo_all(m) )
+#ifdef SALMON_SUBSPACE_ORDERED
+      endif
+#endif
       call timer_end(LOG_SSDG_PERIODIC_CALC)
 
       call timer_begin(LOG_SSDG_PERIODIC_COMM_COLL)
@@ -383,10 +430,18 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
       call timer_end(LOG_SSDG_PERIODIC_COMM_COLL)
 
       call timer_begin(LOG_SSDG_PERIODIC_CALC)
+#ifdef SALMON_SUBSPACE_ORDERED
+      if(ordered) then
+        call subspace_rotate(ordered_workspace,evec,wf2_block)
+      else
+#endif
       call zgemm('N', 'N', nsize_rg, info%numo, info%numo_all(m),  &
         &                one, wf_block_send(:,:,:,1:info%numo_all(m)), nsize_rg,  &
         &                     evec(info%io_s_all(m):info%io_e_all(m), info%io_s:info%io_e), info%numo_all(m),  &
         &                one, wf2_block(:,:,:,1), nsize_rg )
+#ifdef SALMON_SUBSPACE_ORDERED
+      endif
+#endif
     end do ! m
 
     ! Copy wave function
@@ -401,6 +456,15 @@ subroutine ssdg_zwf_cblas(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
   enddo ! ispin
   enddo ! ik
   enddo ! im
+
+#ifdef SALMON_SUBSPACE_ORDERED
+  if(ordered) then
+    call timer_begin(LOG_SSDG_PERIODIC_CALC)
+    call subspace_end(ordered_workspace)
+    write(*,'(a,1x,i0)') 'SUBSPACE_ORDERED_CALL',info%numk
+    call timer_end(LOG_SSDG_PERIODIC_CALC)
+  endif
+#endif
 
 return
 

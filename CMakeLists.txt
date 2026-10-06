@@ -28,6 +28,10 @@ project(SALMON
 # They keep the operation order of the CPU code they replace. All are OFF by default.
 option(SALMON_CG_CUDA "Offload the complex CG solver gscg_zwf to CUDA in CPU builds (see SALMON_CG_CUDA_MODE)" OFF)
 option(SALMON_CG_ORDERED_NONLOCAL "Also apply Hpsi of SALMON_CG_CUDA on the GPU (periodic 16^3 grids)" OFF)
+option(SALMON_SUBSPACE_ORDERED "Compute the subspace-diagonalization ZGEMMs with CUDA (80 orbitals, 16^3 grid)" OFF)
+if(SALMON_SUBSPACE_ORDERED AND NOT SALMON_CG_CUDA)
+  message(FATAL_ERROR "SALMON_SUBSPACE_ORDERED requires SALMON_CG_CUDA")
+endif()
 if(SALMON_CG_ORDERED_NONLOCAL AND NOT SALMON_CG_CUDA)
   message(FATAL_ERROR "SALMON_CG_ORDERED_NONLOCAL requires SALMON_CG_CUDA")
 endif()

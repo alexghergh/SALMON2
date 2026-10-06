@@ -38,6 +38,11 @@ endif()
 
 if(SALMON_CG_CUDA)
   add_library(salmon_cg_cuda STATIC gs/cg_resident.cu)
+  if(SALMON_SUBSPACE_ORDERED)
+    target_sources(salmon_cg_cuda PRIVATE gs/subspace_gemm_ordered.cu gs/subspace_ordered_context.cu)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/gs/subspace_diagonalization.f90
+                 APPEND PROPERTY COMPILE_DEFINITIONS SALMON_SUBSPACE_ORDERED)
+  endif()
   if(SALMON_CG_ORDERED_NONLOCAL)
     target_sources(salmon_cg_cuda PRIVATE gs/cg_nonlocal_ordered.cu gs/cg_stencil_ordered.cu)
     target_compile_definitions(salmon_cg_cuda PRIVATE SALMON_CG_ORDERED_NONLOCAL)
