@@ -15,7 +15,7 @@ module cg_resident_bridge
   type cg_region_state
     type(c_ptr) :: handle=c_null_ptr
     integer :: mode=0
-    logical :: resident=.false.,awaiting_accept=.false.,epoch=.false.
+    logical :: resident=.false.,awaiting_accept=.false.,epoch=.false.,scratch_reused=.false.
     integer :: epoch_iterations=0
     integer :: next_iteration=0,layout(18)=0
     integer(c_int64_t) :: hvol_bits=0
@@ -33,6 +33,14 @@ module cg_resident_bridge
       integer(c_int) :: rc
     end function
     function epoch_begin_gpu(input,h,x,handle) bind(C,name='salmon_cg_epoch_begin') result(rc)
+      import c_int,c_double,c_double_complex,c_ptr,epoch_input
+      type(epoch_input),intent(in) :: input
+      real(c_double),value :: h
+      complex(c_double_complex),intent(in) :: x(*)
+      type(c_ptr),intent(out) :: handle
+      integer(c_int) :: rc
+    end function
+    function epoch_begin_scratch_gpu(input,h,x,handle) bind(C,name='salmon_cg_epoch_begin_scratch') result(rc)
       import c_int,c_double,c_double_complex,c_ptr,epoch_input
       type(epoch_input),intent(in) :: input
       real(c_double),value :: h
@@ -437,7 +445,8 @@ contains
 
   ! Capture is allowed only before the first Hpsi. Every unsupported route returns
   ! with all host fields untouched. Once captured, all failures are fatal.
-  subroutine cg_epoch_begin(s,mg,system,info,stencil,ppg,vlocal,x,p,hx,hp,g,pre_g,hpsi_supported)
+  subroutine cg_epoch_begin(s,mg,system,info,stencil,ppg,vlocal,x,p,hx,hp,g,pre_g,hpsi_supported, &
+                            retain_workspace_outputs)
     type(cg_region_state),intent(inout) :: s
     type(s_rgrid),intent(in) :: mg
     type(s_dft_system),intent(in) :: system
@@ -447,6 +456,8 @@ contains
     type(s_scalar),intent(in) :: vlocal(:)
     type(s_orbital),intent(in) :: x,p,hx,hp,g,pre_g
     logical,intent(in) :: hpsi_supported
+    logical,optional,intent(in) :: retain_workspace_outputs
+    logical :: reuse_scratch
     type(epoch_input) :: m
     integer(c_int),target :: idx(24),idy(24),idz(24)
     real(c_double),allocatable,target :: vl(:,:,:),lap0(:),nabt(:,:,:)
@@ -476,8 +487,17 @@ contains
       write(*,*) 'CG_CUDA EPOCH device fallback=',rc,' rank=',info%id_rko
       return
     endif
-    rc=epoch_begin_gpu(m,system%hvol,x%zwf,s%handle)
+    reuse_scratch=.false.
+    if(selected==2.and.present(retain_workspace_outputs))then
+      reuse_scratch=.not.retain_workspace_outputs
+    endif
+    if(reuse_scratch)then
+      rc=epoch_begin_scratch_gpu(m,system%hvol,x%zwf,s%handle)
+    else
+      rc=epoch_begin_gpu(m,system%hvol,x%zwf,s%handle)
+    endif
     call require_success(rc,'epoch capture',s)
+    s%scratch_reused=reuse_scratch
     s%epoch=.true.;s%resident=.true.;s%mode=selected;s%next_iteration=1;s%epoch_iterations=0
     s%layout=[mg%is,mg%ie,system%nspin,system%no,system%nk,info%io_s,info%io_e, &
               info%ik_s,info%ik_e,info%isize_r,info%id_rko,info%im_s,info%im_e,pady]
@@ -647,6 +667,7 @@ contains
     if(s%mode==2)then
       if(present(retain_workspace_outputs))keep_workspaces=retain_workspace_outputs
     endif
+    if(s%scratch_reused.and.keep_workspaces)call context_error(s,'scratch reuse cannot restore workspace outputs')
     call epoch_output(s,0,x,'final epoch x')
     if(keep_workspaces)then
       call epoch_output(s,1,hx,'final epoch Hx')
@@ -661,7 +682,7 @@ contains
     write(*,*) 'CG_CUDA EPOCH_WORKSPACE_OUTPUTS retained=',keep_workspaces
     rc=close_gpu(s%handle);s%handle=c_null_ptr;call require_success(rc,'epoch close')
     write(*,*) 'CG_CUDA EPOCH_END iterations=',s%epoch_iterations,' mode=',s%mode
-    s%mode=0;s%epoch=.false.;s%resident=.false.;s%next_iteration=0;s%epoch_iterations=0
+    s%mode=0;s%epoch=.false.;s%resident=.false.;s%scratch_reused=.false.;s%next_iteration=0;s%epoch_iterations=0
     s%layout=0;s%hvol_bits=0
   end subroutine
 

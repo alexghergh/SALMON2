@@ -454,7 +454,8 @@ subroutine gscg_zwf(ncg,mg,system,info,stencil,ppg,vlocal,srg,xk,hxk,gk,cg,retai
   call cg_epoch_begin(cuda_region,mg,system,info,stencil,ppg,vlocal,xk,cg%pk,hxk,cg%hpk,gk,cg%pre_gk, &
        yn_preconditioning=='n'.and.yn_spinorbit=='n'.and.yn_periodic=='y'.and.yn_jm=='n'.and. &
        absorbing_boundary/='z'.and..not.PLUS_U_ON.and..not.system%xc_payload%use_tau_operator.and. &
-       .not.optimized_stencil_is_callable.and..not.stencil_is_parallelized_by_omp)
+       .not.optimized_stencil_is_callable.and..not.stencil_is_parallelized_by_omp, &
+       retain_workspace_outputs=keep_workspaces)
 #endif
 
   call timer_end(LOG_GSCG_PERIODIC_CALC)

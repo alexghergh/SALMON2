@@ -115,6 +115,7 @@ struct Context : HpsiDeviceMaps {
     double2 *u=nullptr,*six=nullptr,*norm=nullptr;
     double *e=nullptr;
     bool epoch=false,initial_hpsi=false,initial_done=false;
+    bool g_alias_hp=false; // HP owns the shared scratch allocation when true.
     int directions=0;
 };
 extern "C" int salmon_cg_device_guard(){return hpsi_device_guard();}
@@ -122,7 +123,9 @@ extern "C" int salmon_cg_close(void *handle){
     auto *c=static_cast<Context*>(handle);if(!c)return 0;
     int result=0;
     auto release=[&](const void *p){if(p){int rc=int(cudaFree(const_cast<void*>(p)));if(!result)result=rc;}};
-    release(c->x);release(c->p);release(c->hx);release(c->hp);release(c->g);
+    release(c->x);release(c->p);release(c->hx);
+    release(c->hp);
+    if(!c->g_alias_hp)release(c->g);
     release(c->u);release(c->six);release(c->norm);release(c->e);
 #ifdef SALMON_CG_ORDERED_NONLOCAL
     int map_result=hpsi_maps_close(*c);if(!result)result=map_result;
@@ -260,7 +263,7 @@ extern "C" int salmon_cg_epoch_available(){
     return 0;
 #endif
 }
-extern "C" int salmon_cg_epoch_begin(const EpochInput *input,double h,const double2 *x,void **handle){
+static int epoch_begin(const EpochInput *input,double h,const double2 *x,void **handle,bool reuse_scratch){
     if(!handle)return -1;*handle=nullptr;
     if(!salmon_cg_epoch_available())return -40;
     if(!input||!x)return -41;
@@ -274,7 +277,11 @@ extern "C" int salmon_cg_epoch_begin(const EpochInput *input,double h,const doub
     c->bytes=nv*16*17*16*sizeof(double2);c->physical=nv*4096;c->h=h;c->epoch=true;
 #define TRY(cmd) do{rc=int(cmd);if(rc){salmon_cg_close(c);return rc;}}while(0)
     TRY(hpsi_maps_begin(m,*c));
-    for(double2 **a:{&c->x,&c->p,&c->hx,&c->hp,&c->g})TRY(cudaMalloc(reinterpret_cast<void**>(a),c->bytes));
+    for(double2 **a:{&c->x,&c->p,&c->hx,&c->hp})TRY(cudaMalloc(reinterpret_cast<void**>(a),c->bytes));
+    // Direction consumes G before Hpsi produces HP; gradient_points replaces
+    // HP pointwise with G after products. HP can no longer be returned.
+    if(reuse_scratch){c->g_alias_hp=true;c->g=c->hp;}
+    else TRY(cudaMalloc(reinterpret_cast<void**>(&c->g),c->bytes));
     TRY(cudaMalloc(reinterpret_cast<void**>(&c->u),nv*2*sizeof(double2)));
     TRY(cudaMalloc(reinterpret_cast<void**>(&c->six),nv*6*sizeof(double2)));
     TRY(cudaMalloc(reinterpret_cast<void**>(&c->norm),nv*sizeof(double2)));
@@ -286,9 +293,16 @@ extern "C" int salmon_cg_epoch_begin(const EpochInput *input,double h,const doub
     return -40;
 #endif
 }
+// Preserve the existing ABI and its complete workspace-output contract.
+extern "C" int salmon_cg_epoch_begin(const EpochInput *input,double h,const double2 *x,void **handle){
+    return epoch_begin(input,h,x,handle,false);
+}
+extern "C" int salmon_cg_epoch_begin_scratch(const EpochInput *input,double h,const double2 *x,void **handle){
+    return epoch_begin(input,h,x,handle,true);
+}
 extern "C" int salmon_cg_epoch_query(void *handle,size_t *field_bytes,size_t *map_bytes,size_t *coeff_bytes){
     auto *c=static_cast<Context*>(handle);if(!c||!field_bytes||!map_bytes||!coeff_bytes)return -1;
-    *field_bytes=5*c->bytes;*map_bytes=c->map_bytes;*coeff_bytes=c->coeff_count*sizeof(double2);
+    *field_bytes=(c->g_alias_hp?4:5)*c->bytes;*map_bytes=c->map_bytes;*coeff_bytes=c->coeff_count*sizeof(double2);
     return c->epoch?1:0;
 }
 extern "C" int salmon_cg_epoch_hpsi(void *handle,int initial){
@@ -356,6 +370,8 @@ extern "C" int salmon_cg_epoch_finish(void *handle,const double2 *u,const double
 // Caller owns padding and it is never read from uninitialized device storage.
 extern "C" int salmon_cg_epoch_read(void *handle,int field,double2 *out){
     auto *c=static_cast<Context*>(handle);if(!c||!c->epoch||!out||field<0||field>4)return -1;
+    // After finish the shared buffer holds G, not HP.
+    if(field==4&&c->g_alias_hp)return -43;
     if(field>=3&&c->directions==0)return -42;
     const double2 *src[]={c->x,c->hx,c->g,c->p,c->hp};
     if(field==0)return int(cudaMemcpy(out,src[field],c->bytes,cudaMemcpyDeviceToHost));
