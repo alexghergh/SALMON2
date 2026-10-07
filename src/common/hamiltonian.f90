@@ -996,12 +996,20 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
   ! grid loop below, where kvec_u = k - u(r).
   complex(8), allocatable :: gpsi(:,:,:,:)         ! (3, grid), one orbital at a time
   complex(8), allocatable :: uloc(:,:,:,:)         ! (grid, 3)                    no r-space division
-  complex(8), allocatable :: uorb(:,:,:,:,:,:,:,:) ! (grid, nspin,io,ik,im, 3)    r-space division
+  ! Keep the Cartesian component outside array rank for compilers limited to rank 7.
+  ! Each component retains the contiguous (grid,nspin,io,ik,im) halo-exchange layout.
+  type :: s_tau_complex_flux
+    complex(8), allocatable :: f(:,:,:,:,:,:,:)
+  end type
+  type(s_tau_complex_flux) :: uorb(3)
   ! real (Gamma-only) path
   real(8),    allocatable :: rgpsi(:,:,:,:)
   real(8),    allocatable :: rgw(:,:,:,:)
   real(8),    allocatable :: rwvec(:,:,:,:)         ! (grid, 3)                    no r-space division
-  real(8),    allocatable :: ruorb(:,:,:,:,:,:,:,:) ! (grid, nspin,io,ik,im, 3)    r-space division
+  type :: s_tau_real_flux
+    real(8), allocatable :: f(:,:,:,:,:,:,:)
+  end type
+  type(s_tau_real_flux) :: ruorb(3)
 
 #ifdef USE_OPENACC
   call fail_tau_operator("support is unavailable for OpenACC builds")
@@ -1088,9 +1096,12 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
     ! with u = 0 and the flux held for every local orbital so that one halo exchange
     ! per component feeds the divergence.
     allocate(rgpsi(3,mg%is(1):mg%ie(1),mg%is(2):mg%ie(2),mg%is(3):mg%ie(3)))
-    allocate(ruorb(mg%is_array(1):mg%ie_array(1),mg%is_array(2):mg%ie_array(2),mg%is_array(3):mg%ie_array(3), &
-                   system%nspin,info%io_s:info%io_e,info%ik_s:info%ik_e,info%im_s:info%im_e,3))
-    ruorb = 0d0
+    do d=1,3
+      allocate(ruorb(d)%f(mg%is_array(1):mg%ie_array(1),mg%is_array(2):mg%ie_array(2), &
+                           mg%is_array(3):mg%ie_array(3),system%nspin, &
+                           info%io_s:info%io_e,info%ik_s:info%ik_e,info%im_s:info%im_e))
+      ruorb(d)%f = 0d0
+    end do
     do im=info%im_s,info%im_e
     do ik=info%ik_s,info%ik_e
     do io=info%io_s,info%io_e
@@ -1105,7 +1116,7 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
           rwc(c) = vt * rgpsi(c,ix,iy,iz)
         end do
         do d=1,3
-          ruorb(ix,iy,iz,ispin,io,ik,im,d) = Bmat(d,1)*rwc(1) + Bmat(d,2)*rwc(2) + Bmat(d,3)*rwc(3)
+          ruorb(d)%f(ix,iy,iz,ispin,io,ik,im) = Bmat(d,1)*rwc(1) + Bmat(d,2)*rwc(2) + Bmat(d,3)*rwc(3)
         end do
       end do
       end do
@@ -1116,7 +1127,7 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
     end do
     end do
     do d=1,3
-      call update_overlap_real8(srg, mg, ruorb(:,:,:,:,:,:,:,d))
+      call update_overlap_real8(srg, mg, ruorb(d)%f(:,:,:,:,:,:,:))
     end do
     do im=info%im_s,info%im_e
     do ik=info%ik_s,info%ik_e
@@ -1128,9 +1139,12 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
       do ix=mg%is(1),mg%ie(1)
         rdivg = 0d0
         do n=1,4
-          rdivg = rdivg + cnab(n,1)*( ruorb(mg%idx(ix+n),iy,iz,ispin,io,ik,im,1) - ruorb(mg%idx(ix-n),iy,iz,ispin,io,ik,im,1) ) &
-                        + cnab(n,2)*( ruorb(ix,mg%idy(iy+n),iz,ispin,io,ik,im,2) - ruorb(ix,mg%idy(iy-n),iz,ispin,io,ik,im,2) ) &
-                        + cnab(n,3)*( ruorb(ix,iy,mg%idz(iz+n),ispin,io,ik,im,3) - ruorb(ix,iy,mg%idz(iz-n),ispin,io,ik,im,3) )
+          rdivg = rdivg + cnab(n,1)*( ruorb(1)%f(mg%idx(ix+n),iy,iz,ispin,io,ik,im) &
+                            - ruorb(1)%f(mg%idx(ix-n),iy,iz,ispin,io,ik,im) ) &
+                        + cnab(n,2)*( ruorb(2)%f(ix,mg%idy(iy+n),iz,ispin,io,ik,im) &
+                            - ruorb(2)%f(ix,mg%idy(iy-n),iz,ispin,io,ik,im) ) &
+                        + cnab(n,3)*( ruorb(3)%f(ix,iy,mg%idz(iz+n),ispin,io,ik,im) &
+                            - ruorb(3)%f(ix,iy,mg%idz(iz-n),ispin,io,ik,im) )
         end do
         htpsi%rwf(ix,iy,iz,ispin,io,ik,im) = htpsi%rwf(ix,iy,iz,ispin,io,ik,im) - 0.5d0*rdivg
       end do
@@ -1141,7 +1155,10 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
     end do
     end do
     end do
-    deallocate(rgpsi,ruorb)
+    do d=1,3
+      deallocate(ruorb(d)%f)
+    end do
+    deallocate(rgpsi)
     return
   end if
 
@@ -1211,9 +1228,12 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
   ! flux has to be halo-exchanged between the two passes.  It is built for every
   ! local orbital first so that the exchange is one batched call per component.
   allocate(gpsi(3,mg%is_array(1):mg%ie_array(1),mg%is_array(2):mg%ie_array(2),mg%is_array(3):mg%ie_array(3)))
-  allocate(uorb(mg%is_array(1):mg%ie_array(1),mg%is_array(2):mg%ie_array(2),mg%is_array(3):mg%ie_array(3), &
-                system%nspin,info%io_s:info%io_e,info%ik_s:info%ik_e,info%im_s:info%im_e,3))
-  uorb = (0d0,0d0)
+  do d=1,3
+    allocate(uorb(d)%f(mg%is_array(1):mg%ie_array(1),mg%is_array(2):mg%ie_array(2), &
+                         mg%is_array(3):mg%ie_array(3),system%nspin, &
+                         info%io_s:info%io_e,info%ik_s:info%ik_e,info%im_s:info%im_e))
+    uorb(d)%f = (0d0,0d0)
+  end do
   do im=info%im_s,info%im_e
   do ik=info%ik_s,info%ik_e
   do io=info%io_s,info%io_e
@@ -1235,7 +1255,7 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
         wc(c) = vt * (gpsi(c,ix,iy,iz) + zi*kvec_u(c)*psi0)
       end do
       do d=1,3
-        uorb(ix,iy,iz,ispin,io,ik,im,d) = Bmat(d,1)*wc(1) + Bmat(d,2)*wc(2) + Bmat(d,3)*wc(3)
+        uorb(d)%f(ix,iy,iz,ispin,io,ik,im) = Bmat(d,1)*wc(1) + Bmat(d,2)*wc(2) + Bmat(d,3)*wc(3)
       end do
       htpsi%zwf(ix,iy,iz,ispin,io,ik,im) = htpsi%zwf(ix,iy,iz,ispin,io,ik,im) &
            - 0.5d0*zi*( kvec_u(1)*wc(1) + kvec_u(2)*wc(2) + kvec_u(3)*wc(3) )
@@ -1248,7 +1268,7 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
   end do
   end do
   do d=1,3
-    call update_overlap_complex8(srg, mg, uorb(:,:,:,:,:,:,:,d))
+    call update_overlap_complex8(srg, mg, uorb(d)%f(:,:,:,:,:,:,:))
   end do
   do im=info%im_s,info%im_e
   do ik=info%ik_s,info%ik_e
@@ -1260,9 +1280,9 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
     do ix=mg%is(1),mg%ie(1)
       divg = (0d0,0d0)
       do n=1,4
-        divg = divg + cnab(n,1)*( uorb(mg%idx(ix+n),iy,iz,ispin,io,ik,im,1) - uorb(mg%idx(ix-n),iy,iz,ispin,io,ik,im,1) ) &
-                    + cnab(n,2)*( uorb(ix,mg%idy(iy+n),iz,ispin,io,ik,im,2) - uorb(ix,mg%idy(iy-n),iz,ispin,io,ik,im,2) ) &
-                    + cnab(n,3)*( uorb(ix,iy,mg%idz(iz+n),ispin,io,ik,im,3) - uorb(ix,iy,mg%idz(iz-n),ispin,io,ik,im,3) )
+        divg = divg + cnab(n,1)*( uorb(1)%f(mg%idx(ix+n),iy,iz,ispin,io,ik,im) - uorb(1)%f(mg%idx(ix-n),iy,iz,ispin,io,ik,im) ) &
+                    + cnab(n,2)*( uorb(2)%f(ix,mg%idy(iy+n),iz,ispin,io,ik,im) - uorb(2)%f(ix,mg%idy(iy-n),iz,ispin,io,ik,im) ) &
+                    + cnab(n,3)*( uorb(3)%f(ix,iy,mg%idz(iz+n),ispin,io,ik,im) - uorb(3)%f(ix,iy,mg%idz(iz-n),ispin,io,ik,im) )
       end do
       htpsi%zwf(ix,iy,iz,ispin,io,ik,im) = htpsi%zwf(ix,iy,iz,ispin,io,ik,im) - 0.5d0*divg
     end do
@@ -1273,7 +1293,10 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
   end do
   end do
   end do
-  deallocate(gpsi,uorb)
+  do d=1,3
+    deallocate(uorb(d)%f)
+  end do
+  deallocate(gpsi)
 
 end subroutine add_xc_tau_operator
 
