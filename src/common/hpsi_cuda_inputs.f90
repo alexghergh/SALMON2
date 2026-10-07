@@ -61,6 +61,8 @@ contains
     if(info%io_s<1.or.info%io_e>system%no.or.info%ik_s<1.or.info%ik_e>system%nk)return
     no=info%io_e-info%io_s+1;nk=info%ik_e-info%ik_s+1
     if(no<=0.or.nk<=0)return
+    ! The CUDA stencil handles at most 80 orbitals and 64 k points; check before any packing.
+    if(no>80.or.nk>64)return
     if(int(no,c_int64_t)*int(nk,c_int64_t)>int(huge(0_c_int),c_int64_t)/32)return
     if(.not.allocated(mg%idx).or..not.allocated(mg%idy).or..not.allocated(mg%idz))return
     if(lbound(mg%idx,1)>mg%is(1)-4.or.ubound(mg%idx,1)<mg%ie(1)+4.or. &
