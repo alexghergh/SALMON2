@@ -54,6 +54,9 @@ module communication
   public :: comm_sync_all
   public :: comm_summation
   public :: comm_bcast
+#ifdef USE_OPENACC
+  public :: comm_bcast_device
+#endif
   public :: comm_allgather
   public :: comm_allgatherv ! not implemented in no-mpi environment
   public :: comm_alltoall
@@ -247,6 +250,14 @@ module communication
     module procedure comm_bcast_array5d_double
     module procedure comm_bcast_array5d_dcomplex
   end interface
+
+#ifdef USE_OPENACC
+  ! Broadcast of device data (CUDA-aware MPI), as comm_send_init_device for the halo exchange
+  interface comm_bcast_device
+    ! 2-D array
+    module procedure comm_bcast_device_array2d_double
+  end interface
+#endif
 
   interface comm_allgather
     ! 1-D array
@@ -1457,6 +1468,24 @@ contains
     end if
     MPI_ERROR_CHECK(call MPI_Bcast(val, size(val), MPI_DOUBLE_PRECISION, rank, ngroup, ierr))
   end subroutine
+
+#ifdef USE_OPENACC
+  subroutine comm_bcast_device_array2d_double(val, ngroup, root)
+    use cudafor
+    use mpi, only: MPI_DOUBLE_PRECISION
+    implicit none
+    real(8), intent(inout), device :: val(:,:)
+    integer, intent(in)           :: ngroup
+    integer, intent(in), optional :: root
+    integer :: rank, ierr
+    if (present(root)) then
+      rank = root
+    else
+      rank = 0
+    end if
+    MPI_ERROR_CHECK(call MPI_Bcast(val, size(val), MPI_DOUBLE_PRECISION, rank, ngroup, ierr))
+  end subroutine
+#endif
 
   subroutine comm_bcast_array3d_double(val, ngroup, root)
     use mpi, only: MPI_DOUBLE_PRECISION
