@@ -678,6 +678,11 @@ real(8) :: hmat_block_tmp(info%numo_max, info%numo)
 !complex(8),dimension(system%no,system%no) :: zhmat, zevec
 real(8) :: eval(system%no)
 
+#ifdef USE_OPENACC
+call ssdg_rwf_rblas_gpu(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
+return
+#endif
+
 call timer_begin(LOG_SSDG_PERIODIC_HPSI)
 call hpsi(spsi,shpsi,info,mg,vlocal,system,stencil,srg,ppg)
 call timer_end(LOG_SSDG_PERIODIC_HPSI)
@@ -814,6 +819,246 @@ enddo ! im
 
 return
 end subroutine ssdg_rwf_rblas
+
+#ifdef USE_OPENACC
+!===================================================================================================================================
+! ssdg_rwf_rblas on the GPU (OpenACC builds), following ssdg_zwf_cblas_gpu.
+! The orbital blocks stay on the device: they are packed from spsi%rwf and shpsi%rwf by OpenACC
+! kernels, the subspace Hamiltonian blocks and the rotation are cuBLAS DGEMMs, and the blocks of
+! the other orbital ranks are broadcast as device data (CUDA-aware MPI, as for the halo exchange
+! in sendrecv_grid). The no x no subspace matrix is assembled, summed and diagonalized on the host
+! side as in ssdg_rwf_rblas, except that the default LAPACK DSYEV becomes a cuSOLVER solve on one
+! rank of the r-space/orbital group (where hmat is replicated), followed by a broadcast.
+subroutine ssdg_rwf_rblas_gpu(mg,system,info,stencil,spsi,shpsi,ppg,vlocal,srg)
+  use structures
+  use communication, only: comm_summation,comm_bcast,comm_bcast_device
+  use timer
+  use hamiltonian, only: hpsi
+  use eigen_subdiag_sub
+  use sendrecv_grid, only: s_sendrecv_grid
+  use salmon_global, only: yn_eigenexa,yn_scalapack
+  use openacc, only: acc_wait, acc_async_sync
+  use cublas, only: CUBLAS_OP_N, CUBLAS_OP_T
+  use cublas_wrapper, only: cublasDgemm_wrapper
+  use cusolver_wrapper, only: eigen_dsyev_gpu
+  implicit none
+  type(s_rgrid)        ,intent(in) :: mg
+  type(s_dft_system)   ,intent(in) :: system
+  type(s_parallel_info),intent(in) :: info
+  type(s_stencil),intent(in) :: stencil
+  type(s_pp_grid),intent(in) :: ppg
+  type(s_scalar) ,intent(in) :: vlocal(system%nspin)
+  type(s_orbital)            :: spsi,shpsi
+  type(s_sendrecv_grid)      :: srg
+
+real(8),parameter :: zero = 0d0, one = 1d0
+integer :: im,ispin,ik,io1,io2,nsize_rg,m,numo,numo_max,io_s,istat
+integer :: i,jo,ix,iy,iz,nx,nxy,is1,is2,is3,ie1,ie2,ie3
+real(8),dimension(system%no,system%no) :: hmat,hmat_tmp,evec
+real(8) :: eval(system%no)
+! Device work arrays. They are used only inside the OpenACC data region below, so their host
+! storage is never touched.
+real(8) :: wf1_block((mg%ie(1)-mg%is(1)+1)*(mg%ie(2)-mg%is(2)+1)*(mg%ie(3)-mg%is(3)+1), info%numo)
+real(8) :: wf2_block((mg%ie(1)-mg%is(1)+1)*(mg%ie(2)-mg%is(2)+1)*(mg%ie(3)-mg%is(3)+1), info%numo)
+real(8) :: wf_block_send((mg%ie(1)-mg%is(1)+1)*(mg%ie(2)-mg%is(2)+1)*(mg%ie(3)-mg%is(3)+1), info%numo_max)
+! Blocks of the subspace matrices: device copy for cuBLAS, host copy for MPI and assembly.
+real(8) :: hmat_block(info%numo_max, info%numo)
+real(8) :: hmat_block_tmp(info%numo_max, info%numo)
+real(8) :: evec_block(info%numo_max, info%numo)
+
+call timer_begin(LOG_SSDG_PERIODIC_HPSI)
+call hpsi(spsi,shpsi,info,mg,vlocal,system,stencil,srg,ppg)
+call timer_end(LOG_SSDG_PERIODIC_HPSI)
+
+is1 = mg%is(1); is2 = mg%is(2); is3 = mg%is(3)
+ie1 = mg%ie(1); ie2 = mg%ie(2); ie3 = mg%ie(3)
+nx  = ie1-is1+1
+nxy = nx*(ie2-is2+1)
+nsize_rg = nxy*(ie3-is3+1)
+numo = info%numo
+numo_max = info%numo_max
+io_s = info%io_s
+
+!$acc data create(wf1_block, wf2_block, wf_block_send, hmat_block, evec_block)
+do im = info%im_s, info%im_e
+do ik = info%ik_s, info%ik_e
+do ispin = 1, system%nspin
+
+  call timer_begin(LOG_SSDG_PERIODIC_CALC)
+  ! Copy wave function
+!$acc parallel loop collapse(4) private(jo,iz,iy,ix,i)
+  do jo = 1, numo
+  do iz = is3, ie3
+  do iy = is2, ie2
+  do ix = is1, ie1
+    i = 1 + (ix-is1) + nx*(iy-is2) + nxy*(iz-is3)
+    wf1_block(i,jo) =  spsi%rwf(ix,iy,iz,ispin,io_s-1+jo,ik,im)
+    wf2_block(i,jo) = shpsi%rwf(ix,iy,iz,ispin,io_s-1+jo,ik,im)
+  end do
+  end do
+  end do
+  end do
+
+!$acc kernels
+  wf_block_send(:,:) = 0d0 !to fix NaN for large calc, as in ssdg_rwf_rblas
+!$acc end kernels
+  hmat_tmp = 0d0
+  do m = 0, info%nporbital - 1
+
+    if(m == info%id_o ) then
+!$acc parallel loop collapse(2) private(jo,i)
+      do jo = 1, numo
+      do i = 1, nsize_rg
+        wf_block_send(i,jo) = wf1_block(i,jo)
+      end do
+      end do
+    end if
+    ! The previous subspace-matrix DGEMM has finished (wait after it); MPI may now write wf_block_send.
+    call acc_wait(acc_async_sync)
+    call timer_end(LOG_SSDG_PERIODIC_CALC)
+
+    call timer_begin(LOG_SSDG_PERIODIC_COMM_COLL)
+    if (info%if_divide_orbit) then
+!$acc host_data use_device(wf_block_send)
+      call comm_bcast_device( wf_block_send(:,1:info%numo_all(m)), info%icomm_o, info%irank_io(info%io_s_all(m)))
+!$acc end host_data
+    end if
+    call timer_end(LOG_SSDG_PERIODIC_COMM_COLL)
+
+    call timer_begin(LOG_SSDG_PERIODIC_CALC)
+!$acc kernels
+    hmat_block(:,:) = 0d0
+!$acc end kernels
+!$acc host_data use_device(wf_block_send, wf2_block, hmat_block)
+    istat = cublasDgemm_wrapper(CUBLAS_OP_T, CUBLAS_OP_N, info%numo_all(m), numo, nsize_rg,  &
+      &                         system%hvol, wf_block_send, nsize_rg,  &
+      &                                      wf2_block, nsize_rg,  &
+      &                         zero, hmat_block, numo_max )
+!$acc end host_data
+    if (istat /= 0) stop "ssdg_rwf_rblas_gpu: cuBLAS DGEMM (subspace matrix) failed"
+    call acc_wait(acc_async_sync)
+!$acc update self(hmat_block)
+    call timer_end(LOG_SSDG_PERIODIC_CALC)
+
+    call timer_begin(LOG_SSDG_PERIODIC_COMM_COLL)
+    if (info%if_divide_rspace) then
+      call comm_summation(hmat_block, hmat_block_tmp, numo_max*numo, info%icomm_r)
+    else
+      hmat_block_tmp = hmat_block
+    endif
+    call timer_end(LOG_SSDG_PERIODIC_COMM_COLL)
+
+    call timer_begin(LOG_SSDG_PERIODIC_CALC)
+    do io1 = info%io_s_all(m), info%io_e_all(m)
+    do io2 = info%io_s, info%io_e
+      hmat_tmp(io1,io2) = hmat_block_tmp(io1-info%io_s_all(m)+1, io2-info%io_s+1)
+    end do
+    end do
+
+  end do ! m
+  call timer_end(LOG_SSDG_PERIODIC_CALC)
+
+  call timer_begin(LOG_SSDG_PERIODIC_COMM_COLL)
+  if (info%if_divide_orbit) then
+    call comm_summation(hmat_tmp, hmat, system%no*system%no, info%icomm_o)
+  else
+    hmat = hmat_tmp
+  end if
+  call timer_end(LOG_SSDG_PERIODIC_COMM_COLL)
+
+
+  call timer_begin(LOG_SSDG_PERIODIC_EIGEN)
+  if(yn_eigenexa=='y') then
+#ifdef USE_EIGENEXA
+     call eigen_pdsyevd_ex(info, hmat, eval, evec)
+#else
+     stop "EigenExa does not enabled, please check your build configuration."
+#endif
+  else if(yn_scalapack=='y') then
+#ifdef USE_SCALAPACK
+     call eigen_pdsyevd(info, hmat, eval, evec)
+#else
+     stop "ScaLAPACK does not enabled, please check your build configuration."
+#endif
+  else
+     ! The preceding reductions replicate hmat over the r-space/orbital group:
+     ! solve it once on the GPU and broadcast the eigenpairs.
+     if (info%id_ro == 0) call eigen_dsyev_gpu(hmat, eval, evec)
+     call comm_bcast(eval, info%icomm_ro, 0)
+     call comm_bcast(evec, info%icomm_ro, 0)
+  endif
+  call timer_end(LOG_SSDG_PERIODIC_EIGEN)
+
+  call timer_begin(LOG_SSDG_PERIODIC_CALC)
+!$acc kernels
+  wf2_block(:,:) = 0d0
+  wf_block_send(:,:) = 0d0 !to fix NaN for large calc, as in ssdg_rwf_rblas
+!$acc end kernels
+
+  do m = 0, info%nporbital - 1
+
+    if(m == info%id_o ) then
+!$acc parallel loop collapse(2) private(jo,i)
+      do jo = 1, numo
+      do i = 1, nsize_rg
+        wf_block_send(i,jo) = wf1_block(i,jo)
+      end do
+      end do
+    end if
+    ! The rotation coefficients for the orbitals of rank m, as one contiguous block. The
+    ! rotation DGEMM of rank m-1, which reads evec_block and wf_block_send, has finished (wait
+    ! below), so both may be overwritten here.
+    evec_block(:,:) = 0d0
+    evec_block(1:info%numo_all(m),1:numo) = evec(info%io_s_all(m):info%io_e_all(m), info%io_s:info%io_e)
+!$acc update device(evec_block)
+    call timer_end(LOG_SSDG_PERIODIC_CALC)
+
+    call timer_begin(LOG_SSDG_PERIODIC_COMM_COLL)
+    if (info%if_divide_orbit) then
+!$acc host_data use_device(wf_block_send)
+      call comm_bcast_device( wf_block_send(:,1:info%numo_all(m)), info%icomm_o, info%irank_io(info%io_s_all(m)))
+!$acc end host_data
+    end if
+    call timer_end(LOG_SSDG_PERIODIC_COMM_COLL)
+
+    call timer_begin(LOG_SSDG_PERIODIC_CALC)
+!$acc host_data use_device(wf_block_send, evec_block, wf2_block)
+    istat = cublasDgemm_wrapper(CUBLAS_OP_N, CUBLAS_OP_N, nsize_rg, numo, info%numo_all(m),  &
+      &                         one, wf_block_send, nsize_rg,  &
+      &                              evec_block, numo_max,  &
+      &                         one, wf2_block, nsize_rg )
+!$acc end host_data
+    if (istat /= 0) stop "ssdg_rwf_rblas_gpu: cuBLAS DGEMM (rotation) failed"
+    ! cuBLAS returns before the product is done. Wait for it before the next rank's coefficients
+    ! are copied into evec_block (the host-to-device update is not guaranteed to be ordered after
+    ! the cuBLAS call) and before wf_block_send is refilled, as ssdg_zwf_cblas_gpu waits after
+    ! each ZGEMM. Without this wait, orbital-split runs (nproc_ob > 1) can go wrong from the
+    ! first subspace diagonalization; testsuites 605-608 cover these layouts.
+    call acc_wait(acc_async_sync)
+  end do ! m
+
+  ! Copy wave function
+!$acc parallel loop collapse(4) private(jo,iz,iy,ix,i)
+  do jo = 1, numo
+  do iz = is3, ie3
+  do iy = is2, ie2
+  do ix = is1, ie1
+    i = 1 + (ix-is1) + nx*(iy-is2) + nxy*(iz-is3)
+    spsi%rwf(ix,iy,iz,ispin,io_s-1+jo,ik,im) = wf2_block(i,jo)
+  end do
+  end do
+  end do
+  end do
+  call timer_end(LOG_SSDG_PERIODIC_CALC)
+
+enddo ! ispin
+enddo ! ik
+enddo ! im
+!$acc end data
+
+return
+end subroutine ssdg_rwf_rblas_gpu
+#endif
 
 !===================================================================================================================================
 
