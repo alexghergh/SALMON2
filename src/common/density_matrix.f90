@@ -283,6 +283,11 @@ contains
     integer    :: ix,iy,iz
     real(8)    :: rtmp
     complex(8) :: cpsi
+#if defined(USE_OPENACC) && !defined(USE_GEMM)
+    ! r-divided grid: one (ispin,im) slab of uVpsibox2, laid out so that each
+    ! orbital's <uV|psi> is a contiguous column for the device routine
+    complex(8),allocatable :: uVpsi_acc(:,:,:)
+#endif
 #if defined(USE_OPENACC) && defined(USE_GEMM)
     ! Batched-GEMM nonlocal current: zpseudo's phase-1 contraction, but four
     ! projections per (ilma,io) -- zekr_uV plus x/y/z-weighted copies, stacked
@@ -317,6 +322,9 @@ contains
 #if !defined(USE_OPENACC)
       call calc_uVpsi_rdivided(nspin,info,ppg,psi,uVpsibox,uVpsibox2)
       allocate(uVpsi(ppg%Nlma))
+#elif !defined(USE_GEMM)
+      call calc_uVpsi_rdivided(nspin,info,ppg,psi,uVpsibox,uVpsibox2)
+      allocate(uVpsi_acc(ppg%Nlma,info%io_s:info%io_e,info%ik_s:info%ik_e))
 #endif
     end if
     call timer_end(LOG_CURRENT_CALC_UVPSI_RDIVIDED)
@@ -532,6 +540,29 @@ contains
             end if
           end do
 #else
+          if ( info%if_divide_rspace ) then
+            ! Each rank holds only part of a projector's sphere: <uV|psi> must be the
+            ! icomm_r sum from calc_uVpsi_rdivided (uVpsibox2), as on the CPU path,
+            ! not the local partial sum that calc_current_nonlocal forms.
+            do ik=info%ik_s,info%ik_e
+            do io=info%io_s,info%io_e
+              uVpsi_acc(:,io,ik) = uVpsibox2(ispin,io,ik,im,:)
+            end do
+            end do
+!$acc kernels copyin(ispin,im,uVpsi_acc)
+!$acc loop gang private(ik,io,wrk3,wrk4) reduction(+:jx,jy,jz) collapse(2) independent
+            do ik=info%ik_s,info%ik_e
+            do io=info%io_s,info%io_e
+              call calc_current_nonlocal_rdivided_acc(wrk3,psi%zwf(:,:,:,ispin,io,ik,im),ppg,mg%is_array,mg%ie_array,ik &
+                                                     ,ppg%Nlma,uVpsi_acc(:,io,ik))
+              wrk4 = wrk3 * system%rocc(io,ik,ispin) * system%wtk(ik)
+              jx = jx + wrk4(1)
+              jy = jy + wrk4(2)
+              jz = jz + wrk4(3)
+            end do
+            end do
+!$acc end kernels
+          else
 !$acc kernels copyin(ispin,im)
 !$acc loop gang private(ik,io,wrk3,wrk4) reduction(+:jx,jy,jz) collapse(2) independent
           do ik=info%ik_s,info%ik_e
@@ -544,6 +575,7 @@ contains
           end do
           end do
 !$acc end kernels
+          end if ! info%if_divide_rspace
 #endif
 !$acc exit data copyout(jx,jy,jz)
         end if ! yn_spinorbit=='y'
@@ -612,6 +644,8 @@ contains
     if (info%if_divide_rspace .and. yn_jm=='n' .and. .not. yn_spinorbit=='y') then
 #if !defined(USE_OPENACC)
       deallocate(uVpsibox,uVpsibox2,uVpsi)
+#elif !defined(USE_GEMM)
+      deallocate(uVpsibox,uVpsibox2,uVpsi_acc)
 #endif
     end if
 
@@ -823,6 +857,58 @@ contains
     jw = jw * 2d0
     return
   end subroutine calc_current_nonlocal_rdivided
+
+#if defined(USE_OPENACC) && !defined(USE_GEMM)
+  ! Device counterpart of calc_current_nonlocal_rdivided (same arithmetic, scalar
+  ! reductions as in calc_current_nonlocal). uVpsibox(ilma) is this orbital's
+  ! rinv_uvu*<uV|psi> summed over icomm_r; the x/y/z-weighted projections stay
+  ! local and are summed by the caller's icomm_rko reduction.
+  subroutine calc_current_nonlocal_rdivided_acc(jw,psi,ppg,is_array,ie_array,ik,nlma,uVpsibox)
+    !$acc routine vector
+    use structures
+    implicit none
+    integer   ,intent(in) :: is_array(3),ie_array(3),ik,nlma
+    complex(8),intent(in) :: psi(is_array(1):ie_array(1),is_array(2):ie_array(2),is_array(3):ie_array(3))
+    type(s_pp_grid),intent(in) :: ppg
+    complex(8),intent(in) :: uVpsibox(nlma)
+    real(8)               :: jw(3)
+    !
+    integer    :: ilocal,ilma,ia,j,ix,iy,iz
+    real(8)    :: x,y,z
+    real(8)    :: jw_1,jw_2,jw_3
+    complex(8) :: uVpsi,uVpsi_r(3)
+    jw_1 = 0d0
+    jw_2 = 0d0
+    jw_3 = 0d0
+!$acc loop vector private(ilocal,ilma,ia,uVpsi,uVpsi_r,j,x,y,z,ix,iy,iz) reduction(+:jw_1, jw_2, jw_3)
+    do ilocal=1,ppg%ilocal_nlma
+      ilma=ppg%ilocal_nlma2ilma(ilocal)
+      ia  =ppg%ilocal_nlma2ia  (ilocal)
+      uVpsi_r(1) = 0d0
+      uVpsi_r(2) = 0d0
+      uVpsi_r(3) = 0d0
+      do j=1,ppg%Mps(ia)
+        x = ppg%Rxyz(1,j,ia)
+        y = ppg%Rxyz(2,j,ia)
+        z = ppg%Rxyz(3,j,ia)
+        ix = ppg%Jxyz(1,j,ia)
+        iy = ppg%Jxyz(2,j,ia)
+        iz = ppg%Jxyz(3,j,ia)
+        uVpsi_r(1) = uVpsi_r(1) + conjg(ppg%zekr_uV(j,ilma,ik)) * x * psi(ix,iy,iz)
+        uVpsi_r(2) = uVpsi_r(2) + conjg(ppg%zekr_uV(j,ilma,ik)) * y * psi(ix,iy,iz)
+        uVpsi_r(3) = uVpsi_r(3) + conjg(ppg%zekr_uV(j,ilma,ik)) * z * psi(ix,iy,iz)
+      end do
+      uVpsi = uVpsibox(ilma)
+      jw_1 = jw_1 + aimag(conjg(uVpsi_r(1))*uVpsi)
+      jw_2 = jw_2 + aimag(conjg(uVpsi_r(2))*uVpsi)
+      jw_3 = jw_3 + aimag(conjg(uVpsi_r(3))*uVpsi)
+    end do
+    jw(1) = jw_1 * 2d0
+    jw(2) = jw_2 * 2d0
+    jw(3) = jw_3 * 2d0
+    return
+  end subroutine calc_current_nonlocal_rdivided_acc
+#endif
   
 !===================================================================================================================================
   
