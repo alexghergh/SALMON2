@@ -146,8 +146,17 @@ if(iopt>=2)then
   call timer_begin(LOG_INIT_GS)
   Miter = 0        ! Miter: Iteration counter set to zero
   rion_update = .true.
+#ifdef USE_OPENACC
+  ! init_ps reallocates ppg's arrays, so the device copy made in initialization1_dft
+  ! would keep dangling descriptors (init_ps's own kernels would write through them);
+  ! finalize drops it whatever its reference count, so the re-copy lands.
+!$acc exit data delete(ppg) finalize
+#endif
   call dealloc_init_ps(ppg)
   call init_ps(lg,mg,system,info,fg,poisson,pp,ppg,Vpsl)
+#ifdef USE_OPENACC
+!$acc enter data copyin(ppg)
+#endif
   call calc_nlcc(pp, system, mg, ppn)
   if(yn_auto_mixing=='y') call reset_mixing_rate(mixing)
   call timer_end(LOG_INIT_GS)
