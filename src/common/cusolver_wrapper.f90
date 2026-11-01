@@ -20,6 +20,7 @@ module cusolver_wrapper
   private
 
   public :: eigen_zheev_batched_gpu
+  public :: eigen_dsyev_gpu
 
   type(cusolverDnHandle), save :: handle
   type(cusolverDnParams), save :: params
@@ -34,6 +35,18 @@ module cusolver_wrapper
   integer(c_int8_t), allocatable, target, save :: work_dev(:)
   integer(c_int8_t), allocatable, target, save :: work_host(:)
   integer(c_int),    allocatable, target, save :: info(:)
+
+  ! Workspace of eigen_dsyev_gpu (kept apart from the batched complex solver's workspace).
+  ! The matrix and eigenvalue copies are allocatable, hence managed memory in OpenACC builds,
+  ! as for the complex solver above.
+  integer(c_int64_t), save :: saved_n_real = -1_c_int64_t
+  integer(c_size_t),  save :: ws_dev_bytes_real  = 0_c_size_t
+  integer(c_size_t),  save :: ws_host_bytes_real = 0_c_size_t
+  integer(c_int8_t), allocatable, target, save :: work_dev_real(:)
+  integer(c_int8_t), allocatable, target, save :: work_host_real(:)
+  integer(c_int),    allocatable, target, save :: info_real(:)
+  real(8),           allocatable, target, save :: a_real(:,:)
+  real(8),           allocatable, target, save :: w_real(:)
 
   logical, save :: work_dev_present = .false.
   logical, save :: info_present     = .false.
@@ -97,6 +110,65 @@ module cusolver_wrapper
 
       type(c_ptr), value :: info
     end function cusolverDnXsyevBatched_f
+
+
+    integer(c_int) function cusolverDnXsyevd_bufferSize_f( &
+        handle_c, params_c, jobz, uplo, n, &
+        dataTypeA, A, lda, &
+        dataTypeW, W, computeType, &
+        workspaceInBytesOnDevice, workspaceInBytesOnHost) bind(C, name="cusolverDnXsyevd_bufferSize")
+      import :: c_int, c_int64_t, c_size_t, c_ptr, cudaDataType
+      implicit none
+
+      type(c_ptr), value :: handle_c
+      type(c_ptr), value :: params_c
+      integer(c_int), value :: jobz, uplo
+      integer(c_int64_t), value :: n, lda
+
+      type(cudaDataType), value :: dataTypeA
+      type(c_ptr), value :: A
+
+      type(cudaDataType), value :: dataTypeW
+      type(c_ptr), value :: W
+
+      type(cudaDataType), value :: computeType
+
+      integer(c_size_t) :: workspaceInBytesOnDevice
+      integer(c_size_t) :: workspaceInBytesOnHost
+    end function cusolverDnXsyevd_bufferSize_f
+
+
+    integer(c_int) function cusolverDnXsyevd_f( &
+        handle_c, params_c, jobz, uplo, n, &
+        dataTypeA, A, lda, &
+        dataTypeW, W, computeType, &
+        bufferOnDevice, workspaceInBytesOnDevice, &
+        bufferOnHost, workspaceInBytesOnHost, &
+        info) bind(C, name="cusolverDnXsyevd")
+      import :: c_int, c_int64_t, c_size_t, c_ptr, cudaDataType
+      implicit none
+
+      type(c_ptr), value :: handle_c
+      type(c_ptr), value :: params_c
+      integer(c_int), value :: jobz, uplo
+      integer(c_int64_t), value :: n, lda
+
+      type(cudaDataType), value :: dataTypeA
+      type(c_ptr), value :: A
+
+      type(cudaDataType), value :: dataTypeW
+      type(c_ptr), value :: W
+
+      type(cudaDataType), value :: computeType
+
+      type(c_ptr), value :: bufferOnDevice
+      integer(c_size_t), value :: workspaceInBytesOnDevice
+
+      type(c_ptr), value :: bufferOnHost
+      integer(c_size_t), value :: workspaceInBytesOnHost
+
+      type(c_ptr), value :: info
+    end function cusolverDnXsyevd_f
   end interface
 
 contains
@@ -220,6 +292,102 @@ contains
     call check_cusolver_info(info, batch_size, "cusolverDnXsyevBatched")
 
   end subroutine eigen_zheev_batched_gpu
+
+
+  ! The eigen_dsyev operation of the eigen_lapack module (all eigenpairs of a real symmetric
+  ! matrix, upper triangle referenced, eigenvalues in ascending order) computed on the GPU with
+  ! cusolverDnXsyevd. h, e and v are host arrays with the same shapes as in eigen_dsyev.
+  subroutine eigen_dsyev_gpu(h, e, v)
+    implicit none
+    real(8), intent(in)  :: h(:,:)
+    real(8), intent(out) :: e(:)
+    real(8), intent(out) :: v(:,:)
+
+    integer(c_int) :: stat
+    integer(c_int) :: jobz, uplo
+    type(cudaDataType) :: dtype
+    integer(c_int64_t) :: n64
+    integer :: n
+
+    type(c_ptr) :: A_dev
+    type(c_ptr) :: W_dev
+    type(c_ptr) :: work_dev_ptr
+    type(c_ptr) :: work_host_ptr
+    type(c_ptr) :: info_dev_ptr
+
+    integer(c_size_t) :: ws_dev_need
+    integer(c_size_t) :: ws_host_need
+
+    n = ubound(h,1)
+    if (n <= 0) then
+      write(error_unit,*) "eigen_dsyev_gpu: n must be positive."
+      error stop
+    end if
+    n64 = int(n, c_int64_t)
+
+    jobz  = CUSOLVER_EIG_MODE_VECTOR
+    uplo  = CUBLAS_FILL_MODE_UPPER
+    dtype = cudaDataType(CUDA_R_64F)
+
+    call init_handle_if_needed()
+
+    if (.not. allocated(a_real) .or. saved_n_real /= n64) then
+      if (allocated(a_real)) deallocate(a_real)
+      if (allocated(w_real)) deallocate(w_real)
+      allocate(a_real(n,n), w_real(n))
+    end if
+
+    a_real(:,:) = h(1:n,1:n)
+
+    A_dev = c_loc(a_real(1,1))
+    W_dev = c_loc(w_real(1))
+
+    if (.not. allocated(work_dev_real) .or. saved_n_real /= n64) then
+      stat = cusolverDnXsyevd_bufferSize_f( &
+          handle%handle, params%params, &
+          jobz, uplo, n64, &
+          dtype, A_dev, n64, &
+          dtype, W_dev, dtype, &
+          ws_dev_need, ws_host_need)
+      call check_cusolver(stat, "cusolverDnXsyevd_bufferSize")
+
+      if (allocated(work_dev_real))  deallocate(work_dev_real)
+      if (allocated(work_host_real)) deallocate(work_host_real)
+      if (allocated(info_real))      deallocate(info_real)
+      ws_dev_bytes_real  = ws_dev_need
+      ws_host_bytes_real = ws_host_need
+      allocate(work_dev_real(max(1_c_size_t, ws_dev_bytes_real)))
+      allocate(work_host_real(max(1_c_size_t, ws_host_bytes_real)))
+      allocate(info_real(1))
+      saved_n_real = n64
+    end if
+
+    info_real(1) = 0_c_int
+
+    if (ws_host_bytes_real > 0_c_size_t) then
+      work_host_ptr = c_loc(work_host_real(1))
+    else
+      work_host_ptr = c_null_ptr
+    end if
+    work_dev_ptr = c_loc(work_dev_real(1))
+    info_dev_ptr = c_loc(info_real(1))
+
+    stat = cusolverDnXsyevd_f( &
+        handle%handle, params%params, &
+        jobz, uplo, n64, &
+        dtype, A_dev, n64, &
+        dtype, W_dev, dtype, &
+        work_dev_ptr, ws_dev_bytes_real, &
+        work_host_ptr, ws_host_bytes_real, &
+        info_dev_ptr)
+    call check_cusolver(stat, "cusolverDnXsyevd")
+    call acc_wait(acc_async_sync)
+    call check_cusolver_info(info_real, 1, "cusolverDnXsyevd")
+
+    e(1:n)     = w_real(1:n)
+    v(1:n,1:n) = a_real(1:n,1:n)
+
+  end subroutine eigen_dsyev_gpu
 
 
   subroutine init_handle_if_needed()

@@ -39,4 +39,24 @@ contains
     cublasZgemmStridedBatch_wrapper = cublasZgemmStridedBatched(cublas_handle, transa, transb, m, n, k, alpha, Aarray, lda, strideA, &
       Barray, ldb, strideB, beta, Carray, ldc, strideC, batchCount)
   end function cublasZgemmStridedBatch_wrapper
+
+  ! One real DGEMM on device arrays, for the real-orbital Gram-Schmidt and subspace
+  ! diagonalization. It goes through the strided-batched entry point with one batch, as the
+  ! complex wrapper above. The handle runs on the OpenACC synchronous queue, so the call is
+  ! ordered with the surrounding OpenACC compute constructs. alpha and beta are host variables.
+  integer(4) function cublasDgemm_wrapper(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+    implicit none
+
+    integer, intent(in) :: transa, transb
+    integer, intent(in) :: m, n, k
+    real(8), intent(in) :: alpha, beta
+    real(8), device :: A(*), B(*)
+    real(8), device :: C(*)
+    integer, intent(in) :: lda, ldb, ldc
+
+    call init_handle_if_needed()
+
+    cublasDgemm_wrapper = cublasDgemmStridedBatched(cublas_handle, transa, transb, m, n, k, alpha, A, lda, 0, &
+      B, ldb, 0, beta, C, ldc, 0, 1)
+  end function cublasDgemm_wrapper
 end module
