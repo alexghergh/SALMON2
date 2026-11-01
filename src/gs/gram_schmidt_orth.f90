@@ -838,6 +838,11 @@ contains
       real(8) :: umat(wfi%numo_max,wfi%numo), umat_tmp(wfi%numo_max,wfi%numo)
       real(8) :: DDOT
 
+#ifdef USE_OPENACC
+      call gram_schmidt_col_rblas_gpu(sys, rg, wfi, wf)
+      return
+#endif
+
       nsize_rg = (rg%ie(1)-rg%is(1)+1)*(rg%ie(2)-rg%is(2)+1)*(rg%ie(3)-rg%is(3)+1)
 
       do im = wfi%im_s, wfi%im_e
@@ -1091,6 +1096,331 @@ contains
       return
 
     end subroutine gram_schmidt_col_rblas
+
+#ifdef USE_OPENACC
+    !=======================================================================
+    ! gram_schmidt_col_rblas on the GPU (OpenACC builds).
+    !
+    ! The algorithm and its order of operations are those of gram_schmidt_col_rblas:
+    !  - within the orbitals of a rank, three levels of halving; modified Gram-Schmidt
+    !    (normalize, overlaps, subtract) on the leaves and one block projection per halving;
+    !    fewer than 32 local orbitals are a single leaf;
+    !  - across orbital ranks (if_divide_orbit), rank m broadcasts its orthonormalized block
+    !    and the ranks id_o > m project it out of their own block.
+    ! The orbital blocks stay on the device: they are packed from wf%rwf by an OpenACC kernel,
+    ! updated with cuBLAS, broadcast as device data (CUDA-aware MPI, as for the halo exchange
+    ! in sendrecv_grid), and unpacked into wf%rwf. Only the norms and overlap matrices that
+    ! need an r-space summation (if_divide_rspace) pass through the host.
+    ! The leaf DDOT/DSCAL/DAXPY operations are OpenACC loops and the block products are cuBLAS
+    ! DGEMMs, as in the complex-orbital GPU subspace diagonalization (ssdg_zwf_cblas_gpu).
+    subroutine gram_schmidt_col_rblas_gpu(sys, rg, wfi, wf)
+      use structures, only: s_dft_system, s_rgrid, s_parallel_info, s_orbital
+      use communication, only: comm_bcast_device
+      use openacc, only: acc_wait, acc_async_sync
+      implicit none
+      type(s_dft_system),   intent(in)    :: sys
+      type(s_rgrid),        intent(in)    :: rg
+      type(s_parallel_info),intent(in)    :: wfi
+      type(s_orbital),      intent(inout) :: wf
+
+      integer :: nsize_rg, numo, numo_max, nx, nxy, io_s
+      integer :: is1, is2, is3, ie1, ie2, ie3
+      integer :: ik, im, ispin, m
+      integer :: i, jo, ix, iy, iz
+      integer :: idiv1, idiv2, idiv3, io0_s, io0_e, io1_s, io1_e, io2_s, io2_e, io3_s, io3_e
+      integer :: numo0, numo1, numo1_0, numo1_1, numo2, numo2_0, numo2_1, numo3_0, numo3_1
+      ! Device work arrays. They are used only inside the OpenACC data region below, so their
+      ! host storage is never touched.
+      real(8) :: wf_block((rg%ie(1)-rg%is(1)+1)*(rg%ie(2)-rg%is(2)+1)*(rg%ie(3)-rg%is(3)+1), wfi%numo)
+      real(8) :: wf_block_send((rg%ie(1)-rg%is(1)+1)*(rg%ie(2)-rg%is(2)+1)*(rg%ie(3)-rg%is(3)+1), wfi%numo_max)
+      ! Small matrices: the device copy is used by cuBLAS, the host copy by the r-space summation.
+      real(8) :: umat(wfi%numo_max,wfi%numo), umat_tmp(wfi%numo_max,wfi%numo)
+      real(8) :: coeff(wfi%numo), coeff_tmp(wfi%numo)
+
+      is1 = rg%is(1); is2 = rg%is(2); is3 = rg%is(3)
+      ie1 = rg%ie(1); ie2 = rg%ie(2); ie3 = rg%ie(3)
+      nx  = ie1-is1+1
+      nxy = nx*(ie2-is2+1)
+      nsize_rg = nxy*(ie3-is3+1)
+      numo = wfi%numo
+      numo_max = wfi%numo_max
+      io_s = wfi%io_s
+
+!$acc data create(wf_block, wf_block_send, umat, coeff)
+      do im = wfi%im_s, wfi%im_e
+      do ik = wfi%ik_s, wfi%ik_e
+      do ispin = 1, sys%nspin
+
+        ! Copy wave function
+!$acc parallel loop collapse(4) private(jo,iz,iy,ix,i)
+        do jo = 1, numo
+        do iz = is3, ie3
+        do iy = is2, ie2
+        do ix = is1, ie1
+          i = 1 + (ix-is1) + nx*(iy-is2) + nxy*(iz-is3)
+          wf_block(i,jo) = wf%rwf(ix,iy,iz,ispin,io_s-1+jo,ik,im)
+        end do
+        end do
+        end do
+        end do
+
+        ! Loop for all:
+        do m = 0, wfi%nporbital-1
+          if(wfi%id_o==m)then
+
+          if(numo < 32) then
+
+            call rblas_gpu_leaf(nsize_rg, numo, wf_block, coeff, coeff_tmp, 1, numo, sys%hvol, &
+              &                 wfi%if_divide_rspace, wfi%icomm_r)
+
+          else
+
+            io0_s = 1
+            io0_e = numo
+            numo0 = numo
+
+            numo1_0 = (numo0 + 1)/2
+            numo1_1 = numo0 - numo1_0
+            do idiv1 = 0, 1
+              if( idiv1 == 0 ) then
+                io1_s = io0_s
+                io1_e = io0_s - 1 + numo1_0
+              else
+                io1_s = io0_s     + numo1_0
+                io1_e = io0_e
+              end if
+              numo1 = io1_e - io1_s + 1
+
+              numo2_0 = (numo1 + 1)/2
+              numo2_1 = numo1 - numo2_0
+              do idiv2 = 0, 1
+                if( idiv2 == 0 ) then
+                  io2_s = io1_s
+                  io2_e = io1_s - 1 + numo2_0
+                else
+                  io2_s = io1_s     + numo2_0
+                  io2_e = io1_e
+                end if
+                numo2 = io2_e - io2_s + 1
+
+                numo3_0 = (numo2 + 1)/2
+                numo3_1 = numo2 - numo3_0
+                do idiv3 = 0, 1
+                  if( idiv3 == 0 ) then
+                    io3_s = io2_s
+                    io3_e = io2_s - 1 + numo3_0
+                  else
+                    io3_s = io2_s     + numo3_0
+                    io3_e = io2_e
+                  end if
+
+                  call rblas_gpu_leaf(nsize_rg, numo, wf_block, coeff, coeff_tmp, io3_s, io3_e, sys%hvol, &
+                    &                 wfi%if_divide_rspace, wfi%icomm_r)
+
+                  if(idiv3 == 0) then
+                    call rblas_gpu_project(nsize_rg, numo3_0, numo3_1, &
+                      &  wf_block(:,io2_s:io2_s-1+numo3_0), wf_block(:,io2_s+numo3_0:io2_e), &
+                      &  numo_max, umat, umat_tmp, sys%hvol, wfi%if_divide_rspace, wfi%icomm_r)
+                  end if ! idiv3 == 0
+
+                end do !idiv3
+
+                if(idiv2 == 0) then
+                  call rblas_gpu_project(nsize_rg, numo2_0, numo2_1, &
+                    &  wf_block(:,io1_s:io1_s-1+numo2_0), wf_block(:,io1_s+numo2_0:io1_e), &
+                    &  numo_max, umat, umat_tmp, sys%hvol, wfi%if_divide_rspace, wfi%icomm_r)
+                end if ! idiv2 == 0
+
+              end do !idiv2
+
+              if(idiv1 == 0) then
+                call rblas_gpu_project(nsize_rg, numo1_0, numo1_1, &
+                  &  wf_block(:,io0_s:io0_s-1+numo1_0), wf_block(:,io0_s+numo1_0:io0_e), &
+                  &  numo_max, umat, umat_tmp, sys%hvol, wfi%if_divide_rspace, wfi%icomm_r)
+              end if ! idiv1 == 0
+
+            end do !idiv1
+
+          end if ! if(numo < 32) else
+
+          end if !m==wfi%id_o
+
+          if (wfi%if_divide_orbit) then
+            if (wfi%id_o == m) then
+!$acc parallel loop collapse(2) private(jo,i)
+              do jo = 1, numo_max
+              do i = 1, nsize_rg
+                if (jo <= numo) then
+                  wf_block_send(i,jo) = wf_block(i,jo)
+                else
+                  wf_block_send(i,jo) = 0d0
+                end if
+              end do
+              end do
+            end if
+            ! Pending cuBLAS work may still read wf_block_send: finish it before MPI writes.
+            call acc_wait(acc_async_sync)
+!$acc host_data use_device(wf_block_send)
+            call comm_bcast_device( wf_block_send, wfi%icomm_o, wfi%irank_io(wfi%io_s_all(m)))
+!$acc end host_data
+
+            if( wfi%id_o > m )then
+              call rblas_gpu_project(nsize_rg, numo_max, numo, wf_block_send, wf_block, &
+                &  numo_max, umat, umat_tmp, sys%hvol, wfi%if_divide_rspace, wfi%icomm_r)
+            end if
+          end if ! wfi%if_divide_orbit
+
+        end do !m
+
+        call acc_wait(acc_async_sync)
+!$acc parallel loop collapse(4) private(jo,iz,iy,ix,i)
+        do jo = 1, numo
+        do iz = is3, ie3
+        do iy = is2, ie2
+        do ix = is1, ie1
+          i = 1 + (ix-is1) + nx*(iy-is2) + nxy*(iz-is3)
+          wf%rwf(ix,iy,iz,ispin,io_s-1+jo,ik,im) = wf_block(i,jo)
+        end do
+        end do
+        end do
+        end do
+
+      end do !ispin
+      end do !ik
+      end do !im
+!$acc end data
+
+      return
+
+    end subroutine gram_schmidt_col_rblas_gpu
+
+    !-----------------------------------------------------------------------
+    ! Modified Gram-Schmidt of the columns js..je of w (device data), as in the leaves of
+    ! gram_schmidt_col_rblas: normalize column jo1 (DDOT, DSCAL), take its overlaps with the
+    ! columns jo1+1..je (one DDOT each), and subtract its component from them (one DAXPY each).
+    subroutine rblas_gpu_leaf(nsize_rg, ncol, w, coeff, coeff_tmp, js, je, hvol, if_divide_rspace, icomm_r)
+      use communication, only: comm_summation
+      implicit none
+      integer, intent(in)    :: nsize_rg, ncol, js, je, icomm_r
+      real(8), intent(inout) :: w(nsize_rg, ncol)
+      real(8), intent(inout) :: coeff(ncol), coeff_tmp(ncol)
+      real(8), intent(in)    :: hvol
+      logical, intent(in)    :: if_divide_rspace
+
+      real(8), parameter :: one = 1d0
+      integer :: i, jo1, jo2, nrest
+      real(8) :: norm2, norm2_tmp, rnorm, s
+
+      do jo1 = js, je
+
+        ! normalize the orbital jo1
+        norm2_tmp = 0d0
+!$acc parallel loop reduction(+:norm2_tmp)
+        do i = 1, nsize_rg
+          norm2_tmp = norm2_tmp + w(i,jo1)*w(i,jo1)
+        end do
+        norm2_tmp = norm2_tmp * hvol
+        if (if_divide_rspace) then
+          call comm_summation(norm2_tmp, norm2, icomm_r)
+        else
+          norm2 = norm2_tmp
+        endif
+        rnorm = one/sqrt(norm2)
+!$acc parallel loop
+        do i = 1, nsize_rg
+          w(i,jo1) = rnorm*w(i,jo1)
+        end do
+
+        nrest = je - jo1
+        if (nrest <= 0) cycle
+
+        ! Calculate overlap coefficients:
+!$acc parallel loop gang private(s)
+        do jo2 = jo1+1, je
+          s = 0d0
+!$acc loop vector reduction(+:s)
+          do i = 1, nsize_rg
+            s = s + w(i,jo1)*w(i,jo2)
+          end do
+          coeff(jo2) = s * hvol
+        end do
+        if (if_divide_rspace) then
+!$acc update self(coeff(jo1+1:je))
+          call comm_summation(coeff(jo1+1:je), coeff_tmp(jo1+1:je), nrest, icomm_r)
+          coeff(jo1+1:je) = coeff_tmp(jo1+1:je)
+!$acc update device(coeff(jo1+1:je))
+        endif
+
+        ! Exclude non-orthonormal component:
+!$acc parallel loop collapse(2)
+        do jo2 = jo1+1, je
+        do i = 1, nsize_rg
+          w(i,jo2) = w(i,jo2) - coeff(jo2)*w(i,jo1)
+        end do
+        end do
+
+      end do !jo1
+
+    end subroutine rblas_gpu_leaf
+
+    !-----------------------------------------------------------------------
+    ! Block projection of gram_schmidt_col_rblas on device data:
+    !   umat = hvol * a^T b  (summed over icomm_r when the r-space is divided),  b = b - a umat.
+    subroutine rblas_gpu_project(nsize_rg, na, nb, a, b, ldu, umat, umat_tmp, hvol, if_divide_rspace, icomm_r)
+      use communication, only: comm_summation
+      use cublas, only: CUBLAS_OP_N, CUBLAS_OP_T
+      use cublas_wrapper, only: cublasDgemm_wrapper
+      use openacc, only: acc_wait, acc_async_sync
+      implicit none
+      integer, intent(in)    :: nsize_rg, na, nb, ldu, icomm_r
+      real(8), intent(in)    :: a(nsize_rg, na)
+      real(8), intent(inout) :: b(nsize_rg, nb)
+      real(8), intent(inout) :: umat(ldu, nb), umat_tmp(ldu, nb)
+      real(8), intent(in)    :: hvol
+      logical, intent(in)    :: if_divide_rspace
+
+      real(8), parameter :: zero = 0d0
+      real(8), parameter :: one = 1d0
+      integer :: istat
+
+      if (na <= 0 .or. nb <= 0) return
+
+!$acc host_data use_device(a, b, umat)
+      istat = cublasDgemm_wrapper(CUBLAS_OP_T, CUBLAS_OP_N, na, nb, nsize_rg, &
+        &                         hvol, a, nsize_rg, b, nsize_rg, zero, umat, ldu)
+!$acc end host_data
+      call check_cublas(istat, 'gram_schmidt_col_rblas_gpu: DGEMM (overlap)')
+
+      if (if_divide_rspace) then
+        call acc_wait(acc_async_sync)
+!$acc update self(umat)
+        call comm_summation(umat, umat_tmp, ldu*nb, icomm_r)
+        umat = umat_tmp
+!$acc update device(umat)
+      end if
+
+!$acc host_data use_device(a, b, umat)
+      istat = cublasDgemm_wrapper(CUBLAS_OP_N, CUBLAS_OP_N, nsize_rg, nb, na, &
+        &                         -one, a, nsize_rg, umat, ldu, one, b, nsize_rg)
+!$acc end host_data
+      call check_cublas(istat, 'gram_schmidt_col_rblas_gpu: DGEMM (update)')
+      ! Finish the update before b, a or umat are used outside cuBLAS (leaf loops, host updates,
+      ! MPI): cuBLAS returns before the product is done.
+      call acc_wait(acc_async_sync)
+
+    end subroutine rblas_gpu_project
+
+    subroutine check_cublas(istat, where)
+      use iso_fortran_env, only: error_unit
+      implicit none
+      integer, intent(in) :: istat
+      character(*), intent(in) :: where
+      if (istat /= 0) then
+        write(error_unit,'(a,": cuBLAS status = ",i0)') trim(where), istat
+        error stop
+      end if
+    end subroutine check_cublas
+#endif
 
     !=======================================================================
 
