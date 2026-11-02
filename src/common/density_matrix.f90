@@ -457,6 +457,17 @@ contains
             end if
             cur_stat = cublasCreate(cur_handle)
           end if
+          ! update_pseudo_rt can grow ppg%nps under MD, leaving the nps-sized
+          ! buffers too small (as zpseudo handles for its own copies).
+          if (size(cur_zekr4,1) /= ppg%nps) then
+!$acc exit data delete(cur_zekr4,cur_wf) finalize
+            deallocate(cur_zekr4,cur_wf)
+            allocate(cur_zekr4(ppg%nps, 4*cur_max_nproj, cur_natom))
+            allocate(cur_wf   (ppg%nps, cur_io_block,    cur_natom))
+            cur_zekr4 = (0d0,0d0)
+            cur_wf    = (0d0,0d0)
+!$acc enter data copyin(cur_zekr4,cur_wf)
+          end if
           cur_np4 = 4*cur_max_nproj
           ! cublas must share OpenACC's stream, or the reduction reads the GEMM early.
           cur_stat = cublasSetStream(cur_handle, acc_get_cuda_stream(acc_async_sync))
@@ -473,6 +484,13 @@ contains
                 cur_zekr4(cur_j, cur_p +   cur_max_nproj, cur_ia) = cur_z * ppg%Rxyz(1,cur_j,cur_ia)
                 cur_zekr4(cur_j, cur_p + 2*cur_max_nproj, cur_ia) = cur_z * ppg%Rxyz(2,cur_j,cur_ia)
                 cur_zekr4(cur_j, cur_p + 3*cur_max_nproj, cur_ia) = cur_z * ppg%Rxyz(3,cur_j,cur_ia)
+              else
+                ! mps shrinks as ions move, and the GEMM contracts over all of
+                ! nps, so the padding must be re-zeroed, not left from before.
+                cur_zekr4(cur_j, cur_p,                   cur_ia) = (0d0,0d0)
+                cur_zekr4(cur_j, cur_p +   cur_max_nproj, cur_ia) = (0d0,0d0)
+                cur_zekr4(cur_j, cur_p + 2*cur_max_nproj, cur_ia) = (0d0,0d0)
+                cur_zekr4(cur_j, cur_p + 3*cur_max_nproj, cur_ia) = (0d0,0d0)
               end if
             end do
             end do
