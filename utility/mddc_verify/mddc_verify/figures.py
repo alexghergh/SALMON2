@@ -175,3 +175,63 @@ def compare_figures(series, rep, outdir):
         ax.legend(frameon=False, fontsize=7.5, loc="lower right")
         out += _save(fig, outdir, "compare-" + fname.replace(".", "_"), tab)
     return out
+
+
+def fault_matrix(results, outdir, name="fault-matrix"):
+    """Rows: injected faults; columns: checks that can fire, plus overall/cross-run/stock verdicts."""
+    _style()
+    faults = [r for r in results if r["fault"] != "clean_control"]
+    controls = [r for r in results if r["fault"] == "clean_control"]
+    order = ["exit_status", "normal_termination", "runtime_errors", "gs_convergence", "files_present",
+             "all_values_finite", "table_integrity", "timer_table",
+             "energy_conservation", "energy_balance", "electron_number", "kinematic_identity",
+             "tion_vs_velocities", "trajectory_bounds", "md_step_scf_converged", "dft_md_columns",
+             "bo_energy_conservation", "dc_scf_history", "dc_fragment_energy_consistency", "lcfo_output",
+             "dc_vs_conventional_energy", "dc_spectrum_vs_conventional"]
+    seen = {c for r in results for c in r["fired"] + r["warned"]}
+    checks = [c for c in order if c in seen] + sorted(seen - set(order))
+    extra = ["OVERALL", "cross-run exact", "cross-run tolerance", "stock 112"]
+    cols = checks + extra
+    rows = controls + faults
+    fig, ax = plt.subplots(figsize=(0.42 * len(cols) + 4.5, 0.24 * len(rows) + 1.8), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    glyph = {"fail": "✕", "unknown": "?", "warn": "!", "pass": "✓", "reject": "✕", "accept": "✓"}
+    for i, r in enumerate(rows):
+        vals = {c: ("fail" if c in r["fired"] and c != "exit_status" else
+                    ("unknown" if c in r["fired"] else ("warn" if c in r["warned"] else None))) for c in checks}
+        if "exit_status" in r["fired"]:
+            vals["exit_status"] = "unknown" if r["verdict"] == "unknown" else "fail"
+        vals["OVERALL"] = r["verdict"]
+        vals["cross-run exact"] = r["exact"] if r["exact"] in STATUS else None
+        vals["cross-run tolerance"] = r["tolerance"] if r["tolerance"] in STATUS else None
+        vals["stock 112"] = {"accept": "pass", "reject": "fail"}.get(r["stock"]) if r["stock"] else None
+        for j, c in enumerate(cols):
+            v = vals.get(c)
+            if v is None:
+                continue
+            color = STATUS[v]
+            if c in extra and v == "pass" and r["fault"] != "clean_control":
+                color = "#efe9e9"  # a pass on a faulty copy = missed: pale, with a ✓ glyph
+            ax.add_patch(plt.Rectangle((j + 0.06, i + 0.08), 0.88, 0.84, color=color, linewidth=0))
+            g = glyph.get(v, "")
+            ax.text(j + 0.5, i + 0.52, g, ha="center", va="center", fontsize=7,
+                    color=("#0b0b0b" if v in ("unknown", "warn") or color == "#efe9e9" else "#ffffff"))
+    ax.set_xlim(0, len(cols))
+    ax.set_ylim(len(rows), 0)
+    ax.set_xticks([j + 0.5 for j in range(len(cols))])
+    ax.set_xticklabels(cols, rotation=60, ha="right", fontsize=7.5)
+    ax.set_yticks([i + 0.5 for i in range(len(rows))])
+    ax.set_yticklabels([f"{r['fault']}  [{r['fixture']}]" for r in rows], fontsize=7.5)
+    ax.axvline(len(checks), color=INK2, linewidth=1.0)
+    for s in ax.spines.values():
+        s.set_visible(False)
+    ax.tick_params(length=0)
+    ax.set_title("Fault injection: which check fires (✕ fail, ? unknown, ! warn; pale ✓ = fault missed)",
+                 loc="left", fontsize=9.5)
+    fig.tight_layout()
+    tab = ["| fault | fixture | overall | checks that fired | exact | tolerance | stock 112 |",
+           "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        tab.append(f"| {r['fault']} | {r['fixture']} | {r['verdict']} | {', '.join(r['fired']) or '–'} | "
+                   f"{r['exact'] or '–'} | {r['tolerance'] or '–'} | {r['stock'] or '–'} |")
+    return _save(fig, outdir, name, tab)

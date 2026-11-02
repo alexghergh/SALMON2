@@ -704,3 +704,67 @@ def rt_from_dc(dst, nt=800, ex_offset_per_atom=2e-4, noise=0.01):
     _label(dst, f"SYNTHETIC 'RT from DC' fixture: the RT fixture with an excitation-energy offset rising to "
                 f"{ex_offset_per_atom} eV/atom and early current noise ({noise} of max|J|).")
     return dst
+
+
+# --------------------------------------------------------------------------- testsuite 112 shape
+TS112_INPUT = """&calculation
+  theory='tddft_response'
+/
+&control
+  sysname = 'Si'
+/
+&units
+  unit_system = 'a.u.'
+/
+&system
+  yn_periodic = 'y'
+  al = 10.26d0, 10.26d0, 10.26d0
+  nstate = 32
+  nelec = 32
+  nelem = 1
+  natom = 8
+/
+&tgrid
+  nt = 180
+  dt = 0.16
+/
+&emfield
+  ae_shape1 = 'impulse'
+  epdir_re1 = 0., 0., 1.
+/
+"""
+TS112_JM_Z_REF = -0.000297090762249   # the value testsuites/112_bulk_Si_rt_response_dp checks
+
+
+def testsuite_112(dst):
+    """Files laid out as testsuite 112 writes them (Si_rt.data: 7 header lines, 180 rows, raw
+    line 167 = t 25.6 a.u., field 16 = Jm_z), with Jm_z(25.6) equal to the stock reference."""
+    os.makedirs(dst, exist_ok=True)
+    nt, dt = 180, 0.16
+    w, tau = 0.3, 40.0
+    c = TS112_JM_Z_REF / (math.sin(w * 160 * dt) * math.exp(-160 * dt / tau))
+    out = [rt_data_header(UNITS_AU)]
+    jz = []
+    for n in range(1, nt + 1):
+        t = n * dt
+        j = c * math.sin(w * t) * math.exp(-t / tau) if n != 160 else TS112_JM_Z_REF
+        jz.append(j)
+        out.append(row([t, 0, 0, 0.01, 0, 0, 0, 0, 0, 0.01, 0, 0, 0, 0, 0, j], breaks=(13,)))
+    _write(os.path.join(dst, "Si_rt.data"), "".join(out))
+    e0 = -31.2447727324418
+    lines = ["# Real time calculation: \n", "# Eall: Total energy\n", "# Eall0: Initial total energy\n",
+             "# 1:Time[a.u.] 2:Eall[a.u.] 3:Eall-Eall0[a.u.] \n", row([0.0, e0, 0.0])]
+    steps = []
+    for n in range(10, nt + 1, 10):
+        e = e0 + 2.0e-5 + 1e-9 * n
+        lines.append(row([n * dt, e, e - e0]))
+        steps.append((n, n * dt * AU_TIME_FS, (0.0, 0.0, jz[n - 1]), 32.0, e * AU_ENERGY_EV))
+    _write(os.path.join(dst, "Si_rt_energy.data"), "".join(lines))
+    _write(os.path.join(dst, "outputfile"), rt_stdout(steps, theory="tddft_response"))
+    _write(os.path.join(dst, "inputfile"), TS112_INPUT + "&atomic_red_coor\n" +
+           "".join(f"  'Si' {a} {b} {c_} 1\n" for a, b, c_ in SI_RED) + "/\n")
+    _write(os.path.join(dst, "salmon.exit"), "0\n")
+    _label(dst, "SYNTHETIC testsuite-112-shaped fixture: impulse response of 8-atom Si in the file layout "
+                "of testsuite 112, with the checked value (Si_rt.data line 167, field 16) set to the stock "
+                "reference. Damped-oscillator current elsewhere. SALMON formats.")
+    return dst
