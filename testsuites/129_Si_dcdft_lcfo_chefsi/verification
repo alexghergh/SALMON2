@@ -107,9 +107,9 @@ for line in output_lines:
 if not scf_records:
     fail("DC SCF convergence history is missing")
 scf_iteration, total_energy, scf_residual = scf_records[-1]
-if scf_residual > 1.0e-9:
+if not (scf_residual <= 1.0e-9):
     fail("DC SCF did not reach the requested threshold: %.6e" % scf_residual)
-if abs(total_energy - (-3390.6646)) > 2.0e-2:
+if not (abs(total_energy - (-3390.6646)) <= 2.0e-2):
     fail("DC total energy differs from reference: %.10f eV" % total_energy)
 
 if any(eigenvalues[index] <= 1.0e-3 for index in range(42, 48)):

@@ -67,7 +67,7 @@ for line in output:
 if not scf_records:
     fail("DC SCF convergence history is missing")
 scf_iteration, total_energy, scf_residual = scf_records[-1]
-if scf_residual > 1.0e-9:
+if not (scf_residual <= 1.0e-9):
     fail("DC SCF did not reach threshold: %.6e" % scf_residual)
 if not is_finite(total_energy):
     fail("DC total energy is non-finite")
