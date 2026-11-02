@@ -22,6 +22,7 @@ Sources used in the justifications:
   [T126] testsuites/126_periodic_H2O_dft_md_dp/verification: E_tot at step 20, |d| <= 1e-3 eV.
   [T129] develop testsuites/129_Si_dcdft_lcfo_chefsi/verification: DC total energy |d| <= 2e-2 eV
          (32 atoms = 6.3e-4 eV/atom), 12 LCFO eigenvalues |d| <= 1e-4 Ha, SCF diff <= 1e-9.
+  [T112] testsuites/112_bulk_Si_rt_response_dp/verification: Jm_z |d| <= 1e-8 a.u. (3.4e-5 rel).
   [P]    Yamada & Otobe, arXiv:2606.21125v1, Figs. 3-4 (aSi-512, buffers b=c/2,3c/4,c = 10/15/20
          grid points): at I=1e9 W/cm^2 the DC excitation energy deviates from conventional by
          about 8e-4 (b=c/2), 3e-4 (3c/4) and 2e-4 (c) eV/atom at 20 fs (read off Fig. 3b, by
@@ -152,6 +153,53 @@ TOLERANCES = {
         "unit": "boolean (warn only)",
         "applies": "|E_DC(b)-E_conv| should not grow with buffer size b",
         "why": "[P]: 'increasing the buffer thickness b systematically improves the accuracy'.",
+    },
+    # ------------------------------------------------------------------ cross-run
+    "cross_run_exact": {
+        "unit": "token equality",
+        "applies": "same build route and MPI/GPU layout: every numeric token of every compared "
+                   "file identical, same row counts",
+        "why": "A change that keeps the order of operations (e.g. a GPU port that follows the CPU "
+               "order) must reproduce the saved outputs exactly in the same configuration; the "
+               "first difference is reported with its time.",
+    },
+    "cross_run_energy_atol_per_atom": {
+        "fail": 1e-6, "unit": "eV/atom",
+        "applies": "Eall, Eall-Eall0, Tion, E_work, Uene, E_tot, DC energy, between independent "
+                   "routes (CPU/GPU, 2.3.0/develop, original/modified)",
+        "why": "[T124] 1e-6 eV after 1000 MD steps (3 atoms). [OBS] largest independent-route "
+               "difference 2.2e-10 eV/atom (two CPU MPI layouts, 60 steps); CPU vs GPU "
+               "<= 3.4e-13 eV/atom. Per-atom so it scales to aSi-512; never tighter than the "
+               "printed resolution (the 'DC #SCF' energy is e15.8).",
+    },
+    "cross_run_current_rtol": {
+        "fail": 1e-5, "unit": "relative to max|J| of the reference",
+        "applies": "Jm, Jmi (and other non-field) columns; scale = max over the x/y/z components "
+                   "so a component that is zero by symmetry is judged against the vector",
+        "why": "[T112] 1e-8 a.u. on |Jm_z| = 3e-4 (3.4e-5 relative). [OBS] relative to the vector "
+               "magnitude max|J|: CPU vs GPU <= 4.3e-14, CPU layouts 2.9e-8 (60-180 steps); 1e-5 "
+               "leaves ~350x for growth over 10^4-step runs.",
+    },
+    "cross_run_field_rtol": {
+        "fail": 1e-10, "unit": "relative to max|E|",
+        "applies": "Ac_ext, E_ext (input-determined) and Ac_tot/E_tot in the transverse geometry",
+        "why": "The external field is an analytic function of time; only rounding may differ.",
+    },
+    "cross_run_position_atol": {
+        "fail": 1e-6, "unit": "Angstrom",
+        "applies": "trajectory positions",
+        "why": "1e-6 A is 1e-4 of a typical phonon amplitude; F18.10 resolves 1e-10 A.",
+    },
+    "cross_run_velocity_force_rtol": {
+        "fail": 1e-4, "unit": "relative to max|v| or max|F| of the reference",
+        "applies": "trajectory velocities and forces",
+        "why": "Force reductions differ in order between CPU and GPU; 1e-4 relative force noise "
+               "changes positions by << 1e-6 A over tens of fs. To be calibrated.",
+    },
+    "cross_run_eigen_atol_ha": {
+        "fail": 1e-4, "unit": "Hartree",
+        "applies": "GS / LCFO eigenvalues between routes",
+        "why": "[T129] eigenvalue tolerance.",
     },
 }
 

@@ -18,6 +18,7 @@
                          [--conventional DIR] [--buffer-dirs DIR ...]
                          [--rt-dc DIR --rt-conv DIR] [--testsuite CASE --salmon-version V]
                          [--json OUT]
+  verify.py compare CANDIDATE REFERENCE [--mode ...] [--policy exact|tolerance|both] [--json OUT]
   verify.py tolerances [--json]
 
 Exit status: 0 = pass or warn, 1 = fail, 2 = unknown (missing evidence), 3 = usage error.
@@ -34,6 +35,7 @@ from .physics_md import md_report, dftmd_report
 from .tolerances import TOLERANCES, describe
 from .physics_dc import dc_report, check_rt_dc_vs_conv
 from .stock_refs import detect_case, reference_checks
+from .compare import compare_runs
 
 EXIT = {"pass": 0, "warn": 0, "fail": 1, "unknown": 2}
 EXIT_USAGE = 3
@@ -119,6 +121,13 @@ def main(argv=None):
     c.add_argument("--salmon-version", choices=("2.3.0", "develop"),
                    help="which stock references to use where they differ (129)")
     c.add_argument("--json", help="write the verdict JSON here")
+    p = sub.add_parser("compare", help="compare a candidate run with a reference run")
+    p.add_argument("candidate")
+    p.add_argument("reference")
+    p.add_argument("--mode", default="auto", choices=("auto",) + MODES)
+    p.add_argument("--policy", default="both", choices=("exact", "tolerance", "both"))
+    p.add_argument("--sysname")
+    p.add_argument("--json")
     t = sub.add_parser("tolerances", help="print the tolerances and their sources")
     t.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
@@ -136,6 +145,22 @@ def main(argv=None):
     if args.cmd == "check":
         run, rep = check(args.rundir, args.mode, args.gs_dir, args.conventional, args.buffer_dirs,
                          args.rt_dc, args.rt_conv, args.sysname, args.testsuite, args.salmon_version)
+    else:
+        a, b = Run(args.candidate, args.sysname), Run(args.reference, args.sysname)
+        mode = _mode(b, args.mode)
+        rep = Report(f"{a.dir} vs {b.dir}", f"compare/{mode}/{args.policy}")
+        allseries = {}
+        for pol in (("exact", "tolerance") if args.policy == "both" else (args.policy,)):
+            _, s = compare_runs(a, b, mode, pol, rep)
+            allseries.update(s)
+        if args.policy == "both":
+            for pol in ("exact", "tolerance"):
+                sub = Report(rep.subject, pol)
+                sub.checks = [c for c in rep.checks if c["id"].startswith(("exact:" if pol == "exact" else "tol:"))]
+                rep.notes.append(f"{pol} policy verdict: {sub.verdict().upper()}")
+            rep.notes.append("exact applies to runs of the same build route and layout; "
+                             "tolerance to independent routes (CPU/GPU, versions). The overall verdict "
+                             "above is the stricter of the two; use the policy that applies to the pair.")
     for line in rep.summary_lines():
         print(line)
     for n in rep.notes:
