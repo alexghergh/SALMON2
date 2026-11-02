@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+# The verification compares this run with the layout reference 605, which CTest
+# runs and verifies first (fixture real_orbital_layout_reference).
+producer=../605_bulk_Si_gs_real_orbital_split
+for f in Si8_info.data Si8_eigen.data outputfile; do
+  test -s "$producer/$f" || { echo "missing $producer/$f" >&2; exit 1; }
+done
+grep -q 'end SALMON' "$producer/outputfile" || { echo "$producer did not finish" >&2; exit 1; }
+cp ../pseudo/Si_rps.dat ./
