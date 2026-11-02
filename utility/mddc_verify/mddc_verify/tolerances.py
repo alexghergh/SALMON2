@@ -32,7 +32,8 @@ Sources used in the justifications:
   [OBS]  Runs made while developing this tool (SALMON 2.3.0, CPU and GPU builds): 8-atom silicon
          tddft_pulse (16^3 k-points, Acos2 2e11 W/cm^2, fixed ions) at dt = 2.5 as and 1.25 as;
          60-step silicon RT runs on two CPU MPI layouts and their GPU counterparts; and CPU/GPU
-         pairs of testsuite 112 on three GPU types.
+         pairs of testsuite 112 on three GPU types. tools/observed_noise.py recomputes these
+         differences for any set of run pairs.
 """
 
 TOLERANCES = {
