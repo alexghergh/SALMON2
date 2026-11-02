@@ -74,12 +74,12 @@ reference_value_tr = 32.0
 permissible_error_tr = 0.01
 
 print("Tr[rho(t)] it=1  = %e (Reference = %e)" % (tr1, reference_value_tr))
-if abs(tr1 - reference_value_tr) > permissible_error_tr:
+if not (abs(tr1 - reference_value_tr) <= permissible_error_tr):
     print("Mismatch |%e - %e| > %e)" % (tr1, reference_value_tr, permissible_error_tr))
     sys.exit(-1)  # Failure
 
 print("Tr[rho(t)] it=10 = %e (Reference = %e)" % (tr2, reference_value_tr))
-if abs(tr2 - reference_value_tr) > permissible_error_tr:
+if not (abs(tr2 - reference_value_tr) <= permissible_error_tr):
     print("Mismatch |%e - %e| > %e)" % (tr2, reference_value_tr, permissible_error_tr))
     sys.exit(-1)  # Failure
 
@@ -90,13 +90,13 @@ reference_value_2 = -0.000014095738   # v2 - v1
 permissible_error_2 = 1e-7
 
 print("v1 = %e (Reference = %e)" % (v1, reference_value_1))
-if abs(v1 - reference_value_1) > permissible_error_1:
+if not (abs(v1 - reference_value_1) <= permissible_error_1):
     print("Mismatch |%e - %e| > %e)" % (v1, reference_value_1, permissible_error_1))
     sys.exit(-1)  # Failure
 
 diff = v2 - v1
 print("v2 - v1 = %e (Reference = %e)" % (diff, reference_value_2))
-if abs(diff - reference_value_2) > permissible_error_2:
+if not (abs(diff - reference_value_2) <= permissible_error_2):
     print("Mismatch |%e - %e| > %e)" % (diff, reference_value_2, permissible_error_2))
     sys.exit(-1)  # Failure
 

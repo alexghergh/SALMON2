@@ -51,7 +51,7 @@ for line in open("Si_eigen.data"):
 
 diff1 = v2 - v1
 
-if abs(diff1 - reference_value_1) > permissible_error_1:
+if not (abs(diff1 - reference_value_1) <= permissible_error_1):
     print("Mismatch |%e - %e| > %e)" % (diff1, reference_value_1, permissible_error_1))
     sys.exit(-1)  # Failure
 
