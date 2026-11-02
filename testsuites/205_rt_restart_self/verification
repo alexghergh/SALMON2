@@ -53,7 +53,7 @@ for f in filelist:
     for i in range(7,len(ro)):   # Excluding header
         s = float(ro[i][15])
         d = float(rt[i][15])
-        if abs(d - s) > permissible_error:
+        if not (abs(d - s) <= permissible_error):
             print("Mismatch |%e - %e| > %e)" % (d, s, permissible_error))
             sys.exit(-1)  # Failure
 

@@ -76,11 +76,11 @@ for line in open("Si_eigen.data"):
 diff1=v2-v1
 diff2=v4-v3
 
-if abs(diff1 - reference_value_1) > permissible_error_1:
+if not (abs(diff1 - reference_value_1) <= permissible_error_1):
         print("Mismatch |%e - %e| > %e)" % (diff1, reference_value_1, permissible_error_1))
         sys.exit(-1)  # Failure 
 
-if abs(diff2 - reference_value_2) > permissible_error_2:
+if not (abs(diff2 - reference_value_2) <= permissible_error_2):
         print("Mismatch |%e - %e| > %e)" % (diff2, reference_value_2, permissible_error_2))
         sys.exit(-1)  # Failure 
 
