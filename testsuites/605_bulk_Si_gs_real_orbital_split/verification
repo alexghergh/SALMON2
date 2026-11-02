@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Real-orbital ground state of 8-atom Si with the orbitals split over 4 ranks.
+
+Only the Gamma point is used, so SALMON works with real orbitals. With
+nproc_ob = 4 and 128 states each rank holds 32 orbitals, so the real-orbital
+Gram-Schmidt takes its blocked branch (32 or more orbitals per rank) and both it
+and the subspace diagonalization exchange orbital blocks between ranks.
+
+This case is the layout reference for 606-608, which solve the same system on
+other parallel layouts and compare their results with the outputs of this run.
+
+threshold = 1.d-20 in the inputfile makes every run do exactly nscf = 40 SCF
+iterations, so that all layouts are compared after the same number of steps.
+The '#GS does not converged' message in the outputfile is therefore expected.
+"""
+import math
+import re
+import sys
+
+SYSNAME = 'Si8'
+NPROC_K, NPROC_OB, NPROC_RGRID = 1, 4, (1, 1, 1)
+NSTATE = 128
+NSCF = 40
+NCOMPARE = 32  # eigenvalues 1-32: the 16 occupied states and the 16 lowest empty ones
+
+# Tolerances for the comparisons below. CPU runs of the four layouts 605-608
+# differ from each other by at most 4.1e-6 eV in the total energy and 3.7e-9 Ha
+# in eigenvalues 1-32 after the 40 iterations; CPU and GPU builds on the same
+# layout differ by less than 1e-12 eV and 1e-14 Ha.
+ENERGY_TOL_EV = 1e-4
+EIGEN_TOL_HA = 1e-6
+
+# Reference values of this case: a CPU build (NVHPC 26.1, nvfortran with
+# OpenMP) on 4 MPI ranks with 2 OpenMP threads each.
+REFERENCE = {
+    'total_energy_ev': -854.0532610105178,
+    'eigenvalues_ha': [  # io = 1-32
+        -0.2101210933898602, -0.06088352572344348, -0.05846268565109597, -0.05664503819938977,
+        -0.05561313872630552, -0.0530966108289058, -0.05184392988036526, 0.1230700009575754,
+        0.1239281645559796, 0.1242128789848048, 0.1255986823494731, 0.1265647639720975,
+        0.1271919098734122, 0.2275355398367246, 0.2331824204535906, 0.2368264067699264,
+        0.2453059975309214, 0.2460816903179741, 0.2466279975940381, 0.2481799096780285,
+        0.2501748718371924, 0.2505545479867095, 0.3188497087313375, 0.3210717514089869,
+        0.3242513241102945, 0.3459605759584495, 0.503013977748369, 0.5105696695555383,
+        0.5107470004999306, 0.5938346418318878, 0.5946880613506372, 0.5960690052087195,
+    ],
+}
+
+failures = []
+
+
+def fail(message):
+    failures.append(message)
+    print('Failure: ' + message)
+
+
+def isfinite(x):
+    return isinstance(x, float) and not (math.isnan(x) or math.isinf(x))
+
+
+def within(a, b, tol):
+    # Written so that a NaN, an infinity or a missing value never passes.
+    return isfinite(a) and isfinite(b) and abs(a - b) <= tol
+
+
+def to_float(token):
+    try:
+        return float(token)
+    except ValueError:  # e.g. a '*****' field overflow
+        return float('nan')
+
+
+def read_text(path):
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def read_results(directory):
+    """Iterations, total energy [eV] and eigenvalues [a.u.] of the run in directory."""
+    info = read_text(directory + '/' + SYSNAME + '_info.data')
+    eigen = read_text(directory + '/' + SYSNAME + '_eigen.data')
+    if info is None or eigen is None:
+        return None
+    match = re.search(r'Total number of iteration\s*=\s*(\d+)', info)
+    iterations = int(match.group(1)) if match else None
+    match = re.search(r'Total energy \(eV\)\s*=\s*(\S+)', info)
+    energy = to_float(match.group(1)) if match else None
+    match = re.search(r'esp\[([^\]]*)\]', eigen)
+    unit = match.group(1) if match else None
+    blocks, eigenvalues = 0, []
+    for line in eigen.splitlines():
+        fields = line.split()
+        if line.startswith('k='):
+            blocks += 1
+        elif len(fields) == 3 and fields[0].isdigit():
+            eigenvalues.append(to_float(fields[1]))
+    return dict(iterations=iterations, energy=energy, unit=unit, blocks=blocks,
+                eigenvalues=eigenvalues)
+
+
+def check_run(run, label):
+    if run['iterations'] != NSCF:
+        fail('%s: %r SCF iterations, expected %d' % (label, run['iterations'], NSCF))
+    if not isfinite(run['energy']):
+        fail('%s: total energy is not a finite number: %r' % (label, run['energy']))
+    if run['unit'] != 'a.u.' or run['blocks'] != 1:
+        fail('%s: expected one k-point block of eigenvalues in a.u., found %d in %r'
+             % (label, run['blocks'], run['unit']))
+    bad = [io for io, e in enumerate(run['eigenvalues'], 1) if not isfinite(e)]
+    if bad:
+        fail('%s: %d eigenvalue(s) not finite, first io = %d' % (label, len(bad), bad[0]))
+
+
+def compare(run, energy, eigenvalues, label):
+    if within(run['energy'], energy, ENERGY_TOL_EV):
+        print('Total energy %r eV agrees with %s (%r eV) within %g eV'
+              % (run['energy'], label, energy, ENERGY_TOL_EV))
+    else:
+        fail('total energy %r eV differs from %s (%r eV) by more than %g eV'
+             % (run['energy'], label, energy, ENERGY_TOL_EV))
+    if len(run['eigenvalues']) < NCOMPARE or len(eigenvalues) < NCOMPARE:
+        fail('fewer than %d eigenvalues to compare with %s' % (NCOMPARE, label))
+        return
+    pairs = list(zip(run['eigenvalues'][:NCOMPARE], eigenvalues[:NCOMPARE]))
+    bad = [io for io, (a, b) in enumerate(pairs, 1) if not within(a, b, EIGEN_TOL_HA)]
+    if bad:
+        a, b = pairs[bad[0] - 1]
+        fail('%d of eigenvalues 1-%d differ from %s by more than %g Ha (first io = %d: %r vs %r)'
+             % (len(bad), NCOMPARE, label, EIGEN_TOL_HA, bad[0], a, b))
+    else:
+        print('Eigenvalues 1-%d agree with %s within %g Ha (largest difference %.2e Ha)'
+              % (NCOMPARE, label, EIGEN_TOL_HA, max(abs(a - b) for a, b in pairs)))
+
+
+
+print('#' * 60)
+print('# Verification start')
+
+output = read_text('outputfile')
+if output is None:
+    fail('outputfile not found')
+else:
+    if 'end SALMON' not in output:
+        fail("no 'end SALMON' in outputfile: the run did not finish normally")
+    if not re.search(r'use of real value orbitals\s*=\s*T\b', output):
+        fail('SALMON did not use real orbitals, so the real-orbital routines were not tested')
+    start = output.find('MPI distribution:')
+    block = output[start:start + 400] if start >= 0 else ''
+    nk = re.search(r'nproc_k\s*:\s*(\d+)', block)
+    no = re.search(r'nproc_ob\s*:\s*(\d+)', block)
+    nr = re.search(r'nproc_rgrid\s*:\s*(\d+)\s+(\d+)\s+(\d+)', block)
+    found = (int(nk.group(1)) if nk else None, int(no.group(1)) if no else None,
+             tuple(int(x) for x in nr.groups()) if nr else None)
+    if found != (NPROC_K, NPROC_OB, NPROC_RGRID):
+        fail('MPI distribution (nproc_k, nproc_ob, nproc_rgrid) = %r, expected %r'
+             % (found, (NPROC_K, NPROC_OB, NPROC_RGRID)))
+
+run = read_results('.')
+if run is None:
+    fail('%s_info.data or %s_eigen.data not found' % (SYSNAME, SYSNAME))
+else:
+    check_run(run, 'this run')
+    if len(run['eigenvalues']) != NSTATE:
+        fail('%d eigenvalues, expected nstate = %d' % (len(run['eigenvalues']), NSTATE))
+    compare(run, REFERENCE['total_energy_ev'], REFERENCE['eigenvalues_ha'], 'the stored reference')
+
+if failures:
+    print('# Verification failed: %d problem(s)' % len(failures))
+    sys.exit(1)
+
+print('# Verification end')
+print('#' * 60)
+sys.exit(0)

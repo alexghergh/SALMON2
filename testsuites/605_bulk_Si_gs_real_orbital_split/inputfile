@@ -1,0 +1,52 @@
+&calculation
+  theory = 'dft'
+/
+&control
+  sysname = 'Si8'
+/
+&units
+  unit_system = 'a.u.'
+/
+&parallel
+  nproc_k = 1
+  nproc_ob = 4
+  nproc_rgrid = 1,1,1
+/
+&system
+  yn_periodic = 'y'
+  al = 10.26d0, 10.26d0, 10.26d0
+  nstate = 128
+  nelec = 32
+  nelem = 1
+  natom = 8
+/
+&pseudo
+  izatom(1) = 14
+  file_pseudo(1) = './Si_rps.dat'
+  lmax_ps(1) = 2
+  lloc_ps(1) = 2
+/
+&functional
+  xc = 'PZ'
+/
+&rgrid
+  num_rgrid = 16, 16, 16
+/
+&kgrid
+  num_kgrid = 1, 1, 1
+/
+&scf
+  ncg = 4
+  nscf = 40
+  threshold = 1.d-20
+/
+&atomic_coor
+  'Si' -0.017617 -0.034915 0.015093 1
+  'Si' 2.522244 2.568588 2.551569 1
+  'Si' 5.085800 0.000744 5.083750 1
+  'Si' -0.006635 5.086986 5.089071 1
+  'Si' 5.122452 5.162685 -0.037620 1
+  'Si' 7.667324 2.577743 7.739771 1
+  'Si' 2.572710 7.684668 7.742626 1
+  'Si' 7.649658 7.730847 2.543961 1
+/
