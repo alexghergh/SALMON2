@@ -14,7 +14,9 @@
 # limitations under the License.
 """Command line interface.
 
-  verify.py check RUNDIR [--mode auto|ehrenfest|dft_md|dc|gs|rt] [--gs-dir DIR] [--json OUT]
+  verify.py check RUNDIR [--mode auto|ehrenfest|dft_md|dc|gs|rt] [--gs-dir DIR]
+                         [--conventional DIR] [--buffer-dirs DIR ...]
+                         [--rt-dc DIR --rt-conv DIR] [--json OUT]
   verify.py tolerances [--json]
 
 Exit status: 0 = pass or warn, 1 = fail, 2 = unknown (missing evidence), 3 = usage error.
@@ -29,6 +31,7 @@ from .verdict import Report
 from .generic import generic_report
 from .physics_md import md_report, dftmd_report
 from .tolerances import TOLERANCES, describe
+from .physics_dc import dc_report, check_rt_dc_vs_conv
 
 EXIT = {"pass": 0, "warn": 0, "fail": 1, "unknown": 2}
 EXIT_USAGE = 3
@@ -52,7 +55,8 @@ def _mode(run, requested):
     return m
 
 
-def check(rundir, mode="auto", gs_dir=None, sysname=None):
+def check(rundir, mode="auto", gs_dir=None, conventional=None, buffer_dirs=None, rt_dc=None,
+          rt_conv=None, sysname=None):
     """Verify one run directory; returns (Run, Report)."""
     run = Run(rundir, sysname)
     mode = _mode(run, mode)
@@ -71,6 +75,25 @@ def check(rundir, mode="auto", gs_dir=None, sysname=None):
         md_report(run, rep)
     elif mode == "dft_md":
         dftmd_report(run, rep)
+    elif mode == "dc":
+        conv = Run(conventional, sysname) if conventional else None
+        conv_rep = generic_report(conv, "gs") if conv else None
+        if conv_rep is not None:
+            rep.add("conventional_reference", "generic", conv_rep.verdict(),
+                    f"conventional GS reference {conventional}: {conv_rep.verdict()}",
+                    {"checks": conv_rep.checks})
+        buffers = [Run(d, sysname) for d in (buffer_dirs or [])]
+        dc_report(run, rep, conv, conv_rep, buffers)
+    if rt_dc or rt_conv:
+        a = Run(rt_dc, sysname) if rt_dc else None
+        b = Run(rt_conv, sysname) if rt_conv else None
+        for tag, r in (("rt_dc", a), ("rt_conv", b)):
+            if r is not None:
+                sub = generic_report(r, "rt")
+                md_report(r, sub)
+                rep.add(f"{tag}_run", "generic", sub.verdict(), f"{tag} run {r.dir}: {sub.verdict()}",
+                        {"checks": sub.checks})
+        check_rt_dc_vs_conv(a, b, rep)
     return run, rep
 
 
@@ -82,6 +105,10 @@ def main(argv=None):
     c.add_argument("--mode", default="auto", choices=("auto",) + MODES)
     c.add_argument("--sysname")
     c.add_argument("--gs-dir", help="ground-state run the RT/MD run restarted from")
+    c.add_argument("--conventional", help="DC: conventional GS run of the same structure")
+    c.add_argument("--buffer-dirs", nargs="*", help="DC: runs differing only in num_rgrid_buffer")
+    c.add_argument("--rt-dc", help="RT run started from DC-LCFO orbitals")
+    c.add_argument("--rt-conv", help="RT run started from the conventional GS")
     c.add_argument("--json", help="write the verdict JSON here")
     t = sub.add_parser("tolerances", help="print the tolerances and their sources")
     t.add_argument("--json", action="store_true")
@@ -98,7 +125,8 @@ def main(argv=None):
         return 0
 
     if args.cmd == "check":
-        run, rep = check(args.rundir, args.mode, args.gs_dir, args.sysname)
+        run, rep = check(args.rundir, args.mode, args.gs_dir, args.conventional, args.buffer_dirs,
+                         args.rt_dc, args.rt_conv, args.sysname)
     for line in rep.summary_lines():
         print(line)
     for n in rep.notes:

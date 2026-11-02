@@ -24,7 +24,7 @@ src/io/perflog.f90). The numbers come from small models, not from SALMON runs:
     energy balance holds as it does in real runs (where that ratio is about 0.15);
   * ions: a harmonic (Einstein) model of 8-atom silicon, driven by Z*E(t) under a laser and
     integrated in SALMON's velocity-Verlet order (src/rt/md.f90, part1/part2);
-  * ground state: chosen energies and eigenvalues; format and logic only.
+  * ground state, DC and LCFO: chosen energies and eigenvalues; format and logic only.
 
 Every directory gets a FIXTURE.txt saying what it is.
 """
@@ -559,4 +559,148 @@ def dft_md(dst, nt=200, dt_fs=0.2):
     _write(os.path.join(dst, "salmon.exit"), "0\n")
     _label(dst, f"SYNTHETIC dft_md fixture: harmonic Einstein-model Si8 Born-Oppenheimer MD, nt={nt}, "
                 f"dt={dt_fs} fs, every MD step 'converged'. SALMON formats.")
+    return dst
+
+
+# --------------------------------------------------------------------------- divide and conquer
+def _dc_spectrum(n=66, shift=0.0, noise=0.0, seed=5):
+    rnd = random.Random(seed)
+    occ = [-0.20 + 0.24 * (i / 63) ** 0.8 for i in range(64)]
+    emp = [0.075 + 0.17 * (i / max(1, n - 65)) for i in range(n - 64)]
+    return [v + shift + rnd.uniform(-noise, noise) for v in occ + emp]
+
+
+DC_INPUT = """&calculation
+  theory='dft'
+  yn_dc='y'
+/
+&dc
+  num_fragment=4,1,1
+  nstate_frag=64
+  num_rgrid_buffer={buffer},0,0
+/
+&control
+  sysname='Si'
+/
+&units
+  unit_system='a.u.'
+/
+&system
+  yn_periodic='y'
+  al=41.04d0,10.26d0,10.26d0
+  nstate=66
+  nelec=128
+  nelem=1
+  natom={natom}
+  temperature_k=300d0
+/
+&scf
+  nscf=500
+  threshold=1d-9
+/
+"""
+
+
+def dc(dst, e_per_atom_offset=6e-4, natom=32, buffer=12, nscf_conv=True, conv_e=-3390.6646):
+    """DC run (32-atom Si in 4 fragments, the geometry and sizes of develop's test 129)."""
+    os.makedirs(os.path.join(dst, "data_dcdft", "total"), exist_ok=True)
+    e_dc = conv_e + e_per_atom_offset * natom
+    lines = [banner("dft").rstrip("\n")]
+    n_it = 60 if nscf_conv else 500
+    for n in range(1, n_it + 1):
+        d = 1e-2 * 0.6 ** n if nscf_conv else max(1e-2 * 0.97 ** n, 3e-8)
+        e = e_dc + 5.0 * 0.6 ** n
+        # scf_iteration_dft.f90: '(a, i6 ,3x , a, e15.8, 3x, a, e15.8)'
+        lines.append(f"DC #SCF = {n:6d}   Total Energy = {fe(e, 8, 2).rjust(15)}   "
+                     f"diff = {fe(d, 8, 2).rjust(15)}")
+    lines += [" start DC-LCFO", " basis functions operation: done", " Hamiltonian matrix: done",
+              " lapack diag, #dim=        640", " diagonalization: done", " end DC-LCFO"]
+    _write(os.path.join(dst, "outputfile"), "\n".join(lines) + "\n" + timer_table(GS_TIMERS, 96.0))
+    for frag in range(1, 5):
+        fd = os.path.join(dst, "data_dcdft", "fragments", f"{frag:06d}")
+        os.makedirs(fd, exist_ok=True)
+        # main_dft.f90 writes the global DC energy into every fragment directory
+        _write(os.path.join(fd, "Si_info.data"),
+               f" Total number of iteration = {n_it:12d}\n \n Number of states = {64:12d}\n"
+               f" Number of electrons = {32:12d}\n \n Total energy (eV) = {e_dc + 5.0 * 0.6 ** n_it!r:>22}     \n")
+    vals = _dc_spectrum(shift=2e-5)
+    eg = ["#esp: single-particle energies (eigen energies) calculated by DC-LCFO method",
+          "#io: orbital index", "# 1:io, 2:esp[a.u.]", "# spin=     1"]
+    eg += [f" {i + 1:5d}{fe(v, 16, 3).rjust(26)}" for i, v in enumerate(vals)]
+    _write(os.path.join(dst, "data_dcdft", "total", "Si_eigen.data"), "\n".join(eg) + "\n")
+    _write(os.path.join(dst, "inputfile"), DC_INPUT.format(buffer=buffer, natom=natom))
+    _write(os.path.join(dst, "salmon.exit"), "0\n")
+    _label(dst, f"SYNTHETIC DC fixture (format and logic only, no physics): 32-atom Si geometry of "
+                f"develop test 129, E_DC = E_conv + {e_per_atom_offset} eV/atom, buffer {buffer}.")
+    return dst
+
+
+CONV_INPUT = """&calculation
+  theory='dft'
+/
+&control
+  sysname='Si'
+/
+&units
+  unit_system='a.u.'
+/
+&system
+  yn_periodic='y'
+  al=41.04d0,10.26d0,10.26d0
+  nstate=66
+  nelec=128
+  nelem=1
+  natom={natom}
+/
+&scf
+  threshold=1d-9
+/
+"""
+
+
+def conventional(dst, natom=32, e=-3390.6646):
+    """Conventional GS of the DC fixture's structure, as the DC comparison's reference."""
+    os.makedirs(dst, exist_ok=True)
+    lines = [banner("dft").rstrip("\n")]
+    for n in range(1, 41):
+        lines.append(f" iter={n:6d}     Total Energy={e + 3.0 * 0.7 ** n:19.8f}     Gap={0.6:15.8f}")
+    lines.append(f"  #GS converged at{41:6d}  :" + fe(5e-10, 8, 2).rjust(15))
+    _write(os.path.join(dst, "outputfile"), "\n".join(lines) + "\n" + timer_table(GS_TIMERS, 210.0))
+    vals = _dc_spectrum()
+    eg = ["#esp: single-particle energies (eigen energies)", "#occ: occupation numbers, io: orbital index",
+          "# 1:io, 2:esp[a.u.], 3:occ", f"k= {1:5d},  spin= {1:5d}"]
+    eg += [f" {i + 1:5d}" + fe(v, 16, 3).rjust(26) + fe(2.0 if i < 64 else 0.0, 16, 3).rjust(26)
+           for i, v in enumerate(vals)]
+    _write(os.path.join(dst, "Si_eigen.data"), "\n".join(eg) + "\n")
+    _write(os.path.join(dst, "Si_info.data"),
+           f" Total number of iteration = {40:12d}\n \n Number of states = {66:12d}\n"
+           f" Number of electrons = {128:12d}\n \n Total energy (eV) = {e!r:>22}     \n")
+    _write(os.path.join(dst, "inputfile"), CONV_INPUT.format(natom=natom))
+    _write(os.path.join(dst, "salmon.exit"), "0\n")
+    _label(dst, "SYNTHETIC conventional GS fixture for the DC comparison (format only).")
+    return dst
+
+
+def rt_from_dc(dst, nt=800, ex_offset_per_atom=2e-4, noise=0.01):
+    """The RT fixture, perturbed like an RT run started from DC-LCFO orbitals."""
+    rt(dst, nt=nt)
+    from .readers import read_table
+    en = read_table(os.path.join(dst, "Si_rt_energy.data"))
+    rtd = read_table(os.path.join(dst, "Si_rt.data"))
+    with open(os.path.join(dst, "Si_rt_energy.data")) as fh:
+        out = [l for l in fh if l.startswith("#")]
+    for r_ in en.rows:
+        dE = ex_offset_per_atom * 8 * (1 - math.exp(-r_[0] / 1.0))
+        out.append(row([r_[0], r_[1] + dE, r_[2] + dE]))
+    _write(os.path.join(dst, "Si_rt_energy.data"), "".join(out))
+    with open(os.path.join(dst, "Si_rt.data")) as fh:
+        out = [l for l in fh if l.startswith("#")]
+    jmax = max(abs(r_[13]) for r_ in rtd.rows)
+    for r_ in rtd.rows:
+        rr = list(r_)
+        rr[13] += noise * jmax * math.exp(-r_[0] / 0.5) * math.sin(40 * r_[0])
+        out.append(row(rr, breaks=(13,)))
+    _write(os.path.join(dst, "Si_rt.data"), "".join(out))
+    _label(dst, f"SYNTHETIC 'RT from DC' fixture: the RT fixture with an excitation-energy offset rising to "
+                f"{ex_offset_per_atom} eV/atom and early current noise ({noise} of max|J|).")
     return dst

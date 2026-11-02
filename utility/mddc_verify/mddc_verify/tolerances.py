@@ -20,6 +20,14 @@ here (never change a limit silently).
 Sources used in the justifications:
   [T124] testsuites/124_periodic_H2O_md_dp/verification: Eall at step 1000, |d| <= 1e-6 eV.
   [T126] testsuites/126_periodic_H2O_dft_md_dp/verification: E_tot at step 20, |d| <= 1e-3 eV.
+  [T129] develop testsuites/129_Si_dcdft_lcfo_chefsi/verification: DC total energy |d| <= 2e-2 eV
+         (32 atoms = 6.3e-4 eV/atom), 12 LCFO eigenvalues |d| <= 1e-4 Ha, SCF diff <= 1e-9.
+  [P]    Yamada & Otobe, arXiv:2606.21125v1, Figs. 3-4 (aSi-512, buffers b=c/2,3c/4,c = 10/15/20
+         grid points): at I=1e9 W/cm^2 the DC excitation energy deviates from conventional by
+         about 8e-4 (b=c/2), 3e-4 (3c/4) and 2e-4 (c) eV/atom at 20 fs (read off Fig. 3b, by
+         eye); at I=1e12 W/cm^2 "the current and excitation energy agree almost perfectly"
+         (Fig. 4, final excitation energy about 1.08 eV/atom). No ground-state energy
+         difference DC vs conventional is reported.
   [OBS]  Runs made while developing this tool (SALMON 2.3.0, CPU and GPU builds): 8-atom silicon
          tddft_pulse (16^3 k-points, Acos2 2e11 W/cm^2, fixed ions) at dt = 2.5 as and 1.25 as;
          60-step silicon RT runs on two CPU MPI layouts and their GPU counterparts; and CPU/GPU
@@ -100,6 +108,50 @@ TOLERANCES = {
         "applies": "minimum image distance in any frame",
         "why": "Atoms closer than half the starting nearest-neighbour distance overlap their "
                "pseudopotential cores.",
+    },
+    # ------------------------------------------------------------------ DC
+    "dc_vs_conventional_energy_per_atom": {
+        "warn": 1e-3, "fail": 1e-2, "unit": "eV/atom",
+        "applies": "|E_DC - E_conv|/N, same structure; DC decks use temperature_k=300, the "
+                   "conventional deck none (smearing at 300 K is negligible for a gapped system)",
+        "why": "[P] reports no ground-state energy error. Its RT excitation-energy deviations "
+               "from DC densities are 2e-4 to 8e-4 eV/atom [P]; [T129] reproduces the DC energy "
+               "itself to 6.3e-4 eV/atom. Warn at 1 meV/atom (above all of these), fail at 10 "
+               "meV/atom (DC no longer a usable stand-in for the conventional ground state).",
+    },
+    "dc_homo_lumo_ev": {
+        "warn": 0.05, "fail": 0.2, "unit": "eV",
+        "applies": "LCFO HOMO, LUMO and mid-gap (Fermi-level proxy) vs conventional eigenvalues",
+        "why": "No published reference [P]. [T129] reproduces LCFO eigenvalues to 1e-4 Ha "
+               "(2.7 meV). 0.2 eV is a quarter of the aSi LDA gap scale; provisional.",
+    },
+    "dc_band_energy_per_atom": {
+        "warn": 5e-3, "fail": 2e-2, "unit": "eV/atom",
+        "applies": "band energy 2*sum_occ eps / N, LCFO vs conventional",
+        "why": "Provisional; same reasoning as the total energy, band energy is less "
+               "variational so the limits are 2-5x wider.",
+    },
+    "dc_lcfo_basis_min_ratio": {
+        "fail": 1.0, "unit": "LCFO basis dimension / nstate",
+        "applies": "'lapack diag, #dim=' or 'eigenexa diag, #dim=' in outputfile",
+        "why": "The LCFO basis must span at least the requested global states.",
+    },
+    "rt_dc_vs_conv_excitation_per_atom": {
+        "warn_frac": 0.5, "fail_abs": 1e-3, "fail_rel": 0.02, "unit": "eV/atom",
+        "applies": "max_t |Eex_DC(t)-Eex_conv(t)|/N <= max(fail_abs, fail_rel*max|Eex_conv|/N)",
+        "why": "[P] Fig. 3 (1e9 W/cm^2): published buffers deviate by <= 8e-4 eV/atom, accepted "
+               "by the authors as practical; Fig. 4 (1e12): indistinguishable, i.e. <~1% of "
+               "1.08 eV/atom at plot resolution. Every published curve passes these limits.",
+    },
+    "rt_dc_vs_conv_current_nrms": {
+        "warn": 0.03, "fail": 0.10, "unit": "rms(J_DC-J_conv)/rms(J_conv)",
+        "applies": "current along the field direction over the compared window",
+        "why": "[P] Figs. 3a/4a: 'overall agreement', noise near t=0 for DC. Provisional.",
+    },
+    "dc_buffer_monotonic": {
+        "unit": "boolean (warn only)",
+        "applies": "|E_DC(b)-E_conv| should not grow with buffer size b",
+        "why": "[P]: 'increasing the buffer thickness b systematically improves the accuracy'.",
     },
 }
 
