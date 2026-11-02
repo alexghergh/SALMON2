@@ -42,7 +42,7 @@ for line in open("Au_rt.data"):
        data = line.split()
        val1 = float(data[16-1])
 
-if abs(val1 - reference_value_1) > permissible_error_1:
+if not (abs(val1 - reference_value_1) <= permissible_error_1):
         print("Mismatch |%e - %e| > %e (current)" % (val1, reference_value_1, permissible_error_1))
         flag = flag + 1
 
@@ -53,7 +53,7 @@ for line in open("Au_rt_energy.data"):
        data = line.split()
        val2 = float(data[2-1])
 
-if abs(val2 - reference_value_2) > permissible_error_2:
+if not (abs(val2 - reference_value_2) <= permissible_error_2):
         print("Mismatch |%e - %e| > %e (energy)" % (val2, reference_value_2, permissible_error_2))
         flag = flag + 1
 
