@@ -15,16 +15,20 @@
 """Command line interface.
 
   verify.py check RUNDIR [--mode auto|ehrenfest|dft_md|dc|gs|rt] [--gs-dir DIR] [--json OUT]
+  verify.py tolerances [--json]
 
 Exit status: 0 = pass or warn, 1 = fail, 2 = unknown (missing evidence), 3 = usage error.
 """
 import argparse
+import json
 import os
 import sys
 
 from .run import Run, MODES
 from .verdict import Report
 from .generic import generic_report
+from .physics_md import md_report, dftmd_report
+from .tolerances import TOLERANCES, describe
 
 EXIT = {"pass": 0, "warn": 0, "fail": 1, "unknown": 2}
 EXIT_USAGE = 3
@@ -63,19 +67,35 @@ def check(rundir, mode="auto", gs_dir=None, sysname=None):
                 f"({', '.join(c['id'] + '=' + c['status'] for c in sub.checks if c['status'] != 'pass')})"
                 if st != "pass" else f"ground state at {gs_dir}: all generic checks pass",
                 {"checks": sub.checks})
+    if mode in ("ehrenfest", "rt"):
+        md_report(run, rep)
+    elif mode == "dft_md":
+        dftmd_report(run, rep)
     return run, rep
 
 
 def main(argv=None):
     ap = _Parser(prog="verify.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("check", help="verify one run directory (generic checks)")
+    c = sub.add_parser("check", help="verify one run directory (generic and physics checks)")
     c.add_argument("rundir")
     c.add_argument("--mode", default="auto", choices=("auto",) + MODES)
     c.add_argument("--sysname")
     c.add_argument("--gs-dir", help="ground-state run the RT/MD run restarted from")
     c.add_argument("--json", help="write the verdict JSON here")
+    t = sub.add_parser("tolerances", help="print the tolerances and their sources")
+    t.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
+
+    if args.cmd == "tolerances":
+        if args.json:
+            print(json.dumps({k: describe(k) for k in TOLERANCES}, indent=1))
+        else:
+            for k in TOLERANCES:
+                d = describe(k)
+                lim = ", ".join(f"{x}={d[x]}" for x in ("warn", "fail", "fail_abs", "fail_rel") if x in d)
+                print(f"{k}: {lim} [{d['unit']}]\n    applies: {d['applies']}\n    why: {d['why']}\n")
+        return 0
 
     if args.cmd == "check":
         run, rep = check(args.rundir, args.mode, args.gs_dir, args.sysname)

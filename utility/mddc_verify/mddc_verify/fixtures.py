@@ -22,6 +22,8 @@ src/io/perflog.f90). The numbers come from small models, not from SALMON runs:
     model) for the electronic current. The electronic energy is the field work computed from
     the written current and vector potential, plus 0.15 of its quadrature ambiguity, so the
     energy balance holds as it does in real runs (where that ratio is about 0.15);
+  * ions: a harmonic (Einstein) model of 8-atom silicon, driven by Z*E(t) under a laser and
+    integrated in SALMON's velocity-Verlet order (src/rt/md.f90, part1/part2);
   * ground state: chosen energies and eigenvalues; format and logic only.
 
 Every directory gets a FIXTURE.txt saying what it is.
@@ -30,9 +32,10 @@ import math
 import os
 import random
 
-from .run import AU_ENERGY_EV, AU_TIME_FS, AU_LENGTH_AA
+from .run import AU_ENERGY_EV, AU_TIME_FS, AU_LENGTH_AA, UMASS, KB_AU
 
 HBAR_EV_FS = 0.6582119569          # hbar [eV fs]
+AU_EFIELD_V_PER_AA = 51.42206707   # atomic unit of field in V/Angstrom
 E_EL0 = -858.226563761958          # electronic + ion-ion energy of the 8-atom cell [eV]
 
 SI_RED = [(0, 0, 0), (.25, .25, .25), (.5, 0, .5), (0, .5, .5), (.5, .5, 0), (.75, .25, .75),
@@ -387,4 +390,173 @@ def gs(dst, e_tot=-858.2265707953129, n_iter=57):
     _write(os.path.join(dst, "salmon.exit"), "0\n")
     _label(dst, f"SYNTHETIC ground-state fixture: 8-atom Si, 2x2x2 k-points, {n_iter} SCF iterations, "
                 "chosen eigenvalues and energies (format and logic only). SALMON formats.")
+    return dst
+
+
+# --------------------------------------------------------------------------- molecular dynamics
+def _ion_model(nt, dt_fs, efield_au, seed=7, t0_k=300.0, freq_thz=15.6, z=4.0):
+    """Velocity Verlet in SALMON's order. efield_au(n) -> (Ex,Ey,Ez) at step n (n=0..nt)."""
+    m = UMASS * 28.0
+    k = m * (2 * math.pi * freq_thz * 1e12 * AU_TIME_FS * 1e-15) ** 2
+    dt = dt_fs / AU_TIME_FS
+    r0 = [[c * A_SI / AU_LENGTH_AA for c in p] for p in SI_RED]
+    rnd = random.Random(seed)
+    v = [[rnd.gauss(0, 1) for _ in range(3)] for _ in r0]
+    vcom = [sum(x[c] for x in v) / len(v) for c in range(3)]
+    v = [[x[c] - vcom[c] for c in range(3)] for x in v]
+    t_now = sum(0.5 * m * sum(c * c for c in x) for x in v)
+    t_target = 1.5 * len(v) * KB_AU * t0_k
+    s = math.sqrt(t_target / t_now) if t0_k > 0 else 0.0
+    v = [[c * s for c in x] for x in v]
+    r = [list(p) for p in r0]
+
+    def force(rr, n):
+        e = efield_au(n)
+        return [[-k * (rr[i][c] - r0[i][c]) + z * e[c] for c in range(3)] for i in range(len(rr))]
+
+    def pot(rr):
+        return sum(0.5 * k * (rr[i][c] - r0[i][c]) ** 2 for i in range(len(rr)) for c in range(3))
+
+    f = force(r, 0)
+    ework = 0.0
+    out = [{"r": [x[:] for x in r], "v": [x[:] for x in v], "f": [x[:] for x in f], "U": pot(r),
+            "T": sum(0.5 * m * sum(c * c for c in x) for x in v), "W": 0.0, "vhalf": [x[:] for x in v]}]
+    for n in range(1, nt + 1):
+        v = [[v[i][c] + f[i][c] / m * 0.5 * dt for c in range(3)] for i in range(len(v))]
+        rl, fl = [x[:] for x in r], [x[:] for x in f]
+        r = [[r[i][c] + v[i][c] * dt for c in range(3)] for i in range(len(r))]
+        vhalf = [x[:] for x in v]
+        f = force(r, n)
+        for i in range(len(r)):
+            for c in range(3):
+                ework -= 0.5 * (fl[i][c] + f[i][c]) * (r[i][c] - rl[i][c])
+        v = [[v[i][c] + f[i][c] / m * 0.5 * dt for c in range(3)] for i in range(len(v))]
+        out.append({"r": [x[:] for x in r], "v": [x[:] for x in v], "f": [x[:] for x in f],
+                    "U": pot(r), "T": sum(0.5 * m * sum(c * c for c in x) for x in v), "W": ework,
+                    "vhalf": vhalf})
+    return out, m, z
+
+
+def _xyz_frame(comment, st):
+    """One frame of <sys>_trj.xyz (write_xyz, 'rvf': a2,3f18.10,"  #v=",3f18.10,"  #f=",3f18.10)."""
+    lines = [f"{len(st['r']):12d}", " " + comment]
+    for i in range(len(st["r"])):
+        p = [x * AU_LENGTH_AA for x in st["r"][i]]
+        lines.append("Si" + "".join(f"{x:18.10f}" for x in p) + "  #v=" +
+                     "".join(f"{x:18.10f}" for x in st["v"][i]) + "  #f=" +
+                     "".join(f"{x:18.10f}" for x in st["f"][i]))
+    return "\n".join(lines) + "\n"
+
+
+def _temperature(st, natom=8):
+    return 2 * st["T"] / (3 * natom * KB_AU)
+
+
+MD_INPUT_EXTRA = """&md
+  ensemble = 'NVE'
+  yn_set_ini_velocity = 'y'
+  temperature0_ion_k = 300.0d0
+/
+"""
+
+
+def ehrenfest(dst, pulse=True, nt=8000, dt_fs=0.0025):
+    """Ehrenfest MD of 8-atom silicon: the laser model above plus harmonic ions."""
+    os.makedirs(dst, exist_ok=True)
+    m = laser_response(nt, dt_fs) if pulse else None
+
+    def efield(n):
+        if not pulse or n == 0:
+            return (0.0, 0.0, 0.0)
+        return (m["E"][n - 1] / AU_EFIELD_V_PER_AA, 0.0, 0.0)
+
+    states, mass, z = _ion_model(nt, dt_fs, efield)
+    vol_au = A_SI ** 3 / AU_LENGTH_AA ** 3
+    out = [rt_data_header(UNITS_EV_FS, ions=True)]
+    for n in range(1, nt + 1):
+        a, e, j = (m["A"][n - 1], m["E"][n - 1], m["J"][n - 1]) if pulse else (0.0, 0.0, 0.0)
+        # calc_current_ion uses the half-step velocity (before md part2)
+        ji = [sum(z * st[c] for st in states[n]["vhalf"]) / vol_au * J_AU_TO_EV_FS for c in range(3)]
+        out.append(row([n * dt_fs, a, 0, 0, e, 0, 0, a, 0, 0, e, 0, 0, j, 0, 0] + ji, breaks=(13, 16)))
+    _write(os.path.join(dst, "Si_rt.data"), "".join(out))
+    e_el = m["E_el"] if pulse else [E_EL0] * (nt + 1)
+    lines = ["# Real time calculation: \n", "# Eall: Total energy\n", "# Eall0: Initial total energy\n",
+             "# Tion: Kinetic energy of ions\n", "# Temperature_ion: Temperature of ions\n",
+             "# E_work: Work energy of ions(sum f*dr)\n",
+             "# 1:Time[fs] 2:Eall[eV] 3:Eall-Eall0[eV]# 4:Tion[eV] 5:Temperature_ion[K] 6:E_work[eV] \n"]
+    eall0 = e_el[0] + states[0]["U"] * AU_ENERGY_EV
+    steps = []
+    for n in range(0, nt + 1, 10):
+        eall = e_el[n] + states[n]["U"] * AU_ENERGY_EV
+        lines.append(row([n * dt_fs, eall, eall - eall0, states[n]["T"] * AU_ENERGY_EV,
+                          _temperature(states[n]), states[n]["W"] * AU_ENERGY_EV]))
+        if n:
+            jx = (m["J"][n - 1] if pulse else 0.0) / J_AU_TO_EV_FS
+            steps.append((n, n * dt_fs, (jx, 0.0, 0.0), electron_count(n * dt_fs), eall))
+    _write(os.path.join(dst, "Si_rt_energy.data"), "".join(lines))
+    # initialization_rt.f90 writes the t=0 frame, time_evolution_step.f90 one per out_rvf_rt_step
+    frames = [_xyz_frame(f"#rt   step={-1:8d}   time{fe(0.0, 6, 2).rjust(16)}", states[0])]
+    for n in range(10, nt + 1, 10):
+        frames.append(_xyz_frame(f"#rt   step={n:8d}   time={fe(n * dt_fs / AU_TIME_FS, 6, 2).rjust(16)}"
+                                 f"   T={_temperature(states[n]):12.4f}", states[n]))
+    _write(os.path.join(dst, "Si_trj.xyz"), "".join(frames))
+    inp = RT_INPUT.format(nt=nt, dt=dt_fs, intensity="2e11" if pulse else "0d0")
+    inp = inp.replace("  theory = 'tddft_pulse'\n", "  theory = 'tddft_pulse'\n  yn_md = 'y'\n")
+    _write(os.path.join(dst, "inputfile"), inp + MD_INPUT_EXTRA + SI_COOR)
+    _write(os.path.join(dst, "outputfile"), rt_stdout(steps))
+    _write(os.path.join(dst, "salmon.exit"), "0\n")
+    _label(dst, f"SYNTHETIC Ehrenfest-MD fixture ({'Acos2 pulse' if pulse else 'field-free'}), nt={nt}, "
+                f"dt={dt_fs} fs. Electrons: the laser model of fixtures.rt; ions: harmonic Einstein model "
+                "(15.6 THz, Z=4, m=28 amu, 300 K start) in SALMON's velocity-Verlet order. SALMON formats.")
+    return dst
+
+
+def dft_md(dst, nt=200, dt_fs=0.2):
+    """Born-Oppenheimer MD (theory='dft_md') of the same ion model; every step 'converged'."""
+    os.makedirs(dst, exist_ok=True)
+    states, mass, z = _ion_model(nt, dt_fs, lambda n: (0.0, 0.0, 0.0), seed=11)
+    e_gs = -858.2265707953129
+    hdr = ["# DFT-MD: adiabatic (ground state) molecular dynamics\n"]
+    for a, b in (("Tene", "Kinetic energy of atoms(ions)"), ("Uene", "Potential energy"),
+                 ("Uene0", "Initial potential energy"), ("E_work", "Work energy (sum F*dR)"),
+                 ("E_nh", "Energy of NH thermostat"), ("E_tot", "Total energy(=Tene+Uene)"),
+                 ("E_tot0", "Initial total energy"), ("Hnvt", "Hamiltonian with NH thermostat"),
+                 ("Hnvt'", "Hnvt using E_work"), ("Temperature", "Temperature of atoms")):
+        hdr.append(f"# {a}: {b}\n")
+    hdr.append("# 1:Time[fs] 2:Tene[eV] 3:Uene[eV] 4:Uene-Uene0[eV] 5:E_work[eV] 6:E_nh[eV] "
+               "7:E_tot[eV] 8:E_tot-E_tot0[eV] 9:Hnvt(2+3+6)[eV] 10:Hnvt(2+5+6)'[eV] 11:Temperature_ion[K]\n")
+    lines = list(hdr)
+    u0 = e_gs + states[0]["U"] * AU_ENERGY_EV
+    et0 = u0 + states[0]["T"] * AU_ENERGY_EV
+    so = ["# 1.time[au], 2.Tene(ion)[au], 3.Uene(gs)[au], 4.Ework[au], 5.Etot[au], 6.Etot-Etot0[au], "
+          "7.Enh[au], 8.Htot[au], 9.Temperature_ion[K], 10.convergency[au]"]
+    rnd = random.Random(3)
+    for n in range(nt + 1):
+        T_ = states[n]["T"] * AU_ENERGY_EV
+        U_ = e_gs + states[n]["U"] * AU_ENERGY_EV
+        W_ = states[n]["W"] * AU_ENERGY_EV
+        temp = _temperature(states[n])
+        lines.append(row([n * dt_fs, T_, U_, U_ - u0, W_, 0.0, T_ + U_, T_ + U_ - et0, U_, T_ + W_, temp]))
+        if n >= 1:   # main_dft_md.f90: format(1x,f10.4, 7e20.10E3,f12.3,e15.8)
+            res = 10 ** rnd.uniform(-9.5, -8.2)
+            so.append(f" {n * dt_fs / AU_TIME_FS:10.4f}" + "".join(fe(x / AU_ENERGY_EV, 10, 3).rjust(20) for x in
+                                                               (T_, U_, W_, T_ + U_, T_ + U_ - et0, 0.0, U_))
+                      + f"{temp:12.3f}" + fe(res, 8, 2).rjust(15))
+    _write(os.path.join(dst, "Si_dft_md.data"), "".join(lines))
+    frames = []
+    for n in range(1, nt + 1):    # main_dft_md.f90 format 110
+        frames.append(_xyz_frame(f"#md-gs  step={n:8d}   time{fe(n * dt_fs / AU_TIME_FS, 6, 2).rjust(16)}",
+                                 states[n]))
+    _write(os.path.join(dst, "Si_trj.xyz"), "".join(frames))
+    inp = GS_INPUT.replace("theory = 'dft'", "theory = 'dft_md'").replace(
+        "unit_system = 'a.u.'", "unit_system = 'A_eV_fs'").replace(
+        "al = 10.26d0, 10.26d0, 10.26d0", "al = 5.43, 5.43, 5.43").replace(
+        "  threshold = 1.d-9\n", f"  threshold = 1.d-8\n/\n&tgrid\n  dt = {dt_fs}\n  nt = {nt}\n")
+    inp += MD_INPUT_EXTRA.replace("/\n", "  step_update_ps = 1\n/\n") + \
+        "&analysis\n  yn_out_rvf_rt = 'y'\n  out_rvf_rt_step = 1\n/\n" + SI_COOR
+    _write(os.path.join(dst, "inputfile"), inp)
+    _write(os.path.join(dst, "outputfile"), banner("dft_md") + "\n".join(so) + "\n" + timer_table(GS_TIMERS, 812.0))
+    _write(os.path.join(dst, "salmon.exit"), "0\n")
+    _label(dst, f"SYNTHETIC dft_md fixture: harmonic Einstein-model Si8 Born-Oppenheimer MD, nt={nt}, "
+                f"dt={dt_fs} fs, every MD step 'converged'. SALMON formats.")
     return dst
