@@ -14,6 +14,7 @@ print("# Verification start")
 
 filelist = [ 
     "H2O_rt_energy.data", 
+    "H2O_rt.data",
 ] 
 
 checklist = { 
@@ -51,6 +52,30 @@ for name, [resval, refval, error] in checklist.items():
         if not (abs(result[name] - refval) <= error): 
             print("Mismatch |%e - %e| > %e)" % (result[name], refval, error)) 
             sys.exit(-1)  # Failure 
+
+# Electron current Jm at the last step (t = 0.25 fs), after 19 projector
+# updates (step_update_ps = 50). Reference: develop CPU build; CPU and GPU
+# builds and r-space/orbital layouts agree within 1e-11.
+current_ref = {
+    "Jm_x": [13,  0.157166188934894E-003],
+    "Jm_y": [14, -0.984441482496257E-004],
+    "Jm_z": [15, -0.498432449985847E-004],
+}
+current_err = 1e-8
+
+last = None
+for line in open("H2O_rt.data"):
+    if line.strip() and not line.lstrip().startswith("#"):
+        last = line.split()
+if last is None or abs(float(last[0]) - 0.25) > 1e-6:
+    print("Last step of H2O_rt.data not found")
+    sys.exit(-1)  # Failure
+for name, [col, refval] in current_ref.items():
+    val = float(last[col])
+    print("Result %s = %e (Reference = %e)" % (name, val, refval))
+    if not (abs(val - refval) <= current_err):
+        print("Mismatch |%e - %e| > %e)" % (val, refval, current_err))
+        sys.exit(-1)  # Failure
 
 print("# Verification end") 
 print("#" * 60) 
