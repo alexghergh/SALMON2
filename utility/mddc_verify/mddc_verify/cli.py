@@ -16,7 +16,8 @@
 
   verify.py check RUNDIR [--mode auto|ehrenfest|dft_md|dc|gs|rt] [--gs-dir DIR]
                          [--conventional DIR] [--buffer-dirs DIR ...]
-                         [--rt-dc DIR --rt-conv DIR] [--json OUT]
+                         [--rt-dc DIR --rt-conv DIR] [--testsuite CASE --salmon-version V]
+                         [--json OUT]
   verify.py tolerances [--json]
 
 Exit status: 0 = pass or warn, 1 = fail, 2 = unknown (missing evidence), 3 = usage error.
@@ -32,6 +33,7 @@ from .generic import generic_report
 from .physics_md import md_report, dftmd_report
 from .tolerances import TOLERANCES, describe
 from .physics_dc import dc_report, check_rt_dc_vs_conv
+from .stock_refs import detect_case, reference_checks
 
 EXIT = {"pass": 0, "warn": 0, "fail": 1, "unknown": 2}
 EXIT_USAGE = 3
@@ -56,7 +58,7 @@ def _mode(run, requested):
 
 
 def check(rundir, mode="auto", gs_dir=None, conventional=None, buffer_dirs=None, rt_dc=None,
-          rt_conv=None, sysname=None):
+          rt_conv=None, sysname=None, testsuite=None, salmon_version=None):
     """Verify one run directory; returns (Run, Report)."""
     run = Run(rundir, sysname)
     mode = _mode(run, mode)
@@ -94,6 +96,9 @@ def check(rundir, mode="auto", gs_dir=None, conventional=None, buffer_dirs=None,
                 rep.add(f"{tag}_run", "generic", sub.verdict(), f"{tag} run {r.dir}: {sub.verdict()}",
                         {"checks": sub.checks})
         check_rt_dc_vs_conv(a, b, rep)
+    case = testsuite or detect_case(rundir)
+    if case:
+        reference_checks(run, rep, case, salmon_version)
     return run, rep
 
 
@@ -109,6 +114,10 @@ def main(argv=None):
     c.add_argument("--buffer-dirs", nargs="*", help="DC: runs differing only in num_rgrid_buffer")
     c.add_argument("--rt-dc", help="RT run started from DC-LCFO orbitals")
     c.add_argument("--rt-conv", help="RT run started from the conventional GS")
+    c.add_argument("--testsuite", help="testsuite case name (default: the run directory's name "
+                   "if it is 124, 126, 129 or 130) for the NaN-safe stock reference values")
+    c.add_argument("--salmon-version", choices=("2.3.0", "develop"),
+                   help="which stock references to use where they differ (129)")
     c.add_argument("--json", help="write the verdict JSON here")
     t = sub.add_parser("tolerances", help="print the tolerances and their sources")
     t.add_argument("--json", action="store_true")
@@ -126,7 +135,7 @@ def main(argv=None):
 
     if args.cmd == "check":
         run, rep = check(args.rundir, args.mode, args.gs_dir, args.conventional, args.buffer_dirs,
-                         args.rt_dc, args.rt_conv, args.sysname)
+                         args.rt_dc, args.rt_conv, args.sysname, args.testsuite, args.salmon_version)
     for line in rep.summary_lines():
         print(line)
     for n in rep.notes:
